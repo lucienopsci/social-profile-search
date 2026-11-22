@@ -1,0 +1,1 @@
+"""Package des workflows: le worker découvre automatiquement tout ce package."""
