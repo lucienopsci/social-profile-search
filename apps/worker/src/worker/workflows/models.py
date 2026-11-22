@@ -51,3 +51,15 @@ class ProcessTargetParams(BaseModel):
     target: TargetInput
     sheet_name: str
     platforms: list[str]
+
+
+# Constantes de sortie (définies ici car pures: le sandbox de workflow interdit
+# d'importer les modules d'E/S depuis le code de workflow).
+CSV_HEADERS = [
+    "search_query", "platform", "account_id", "account_username",
+    "account_name", "account_description", "followers", "url", "relevant",
+]
+DASHBOARD_HEADERS = [
+    "target_id", "name", "platform", "searched", "accounts_returned",
+    "accounts_checked", "accounts_relevant", "cost_usd", "error", "updated_at",
+]

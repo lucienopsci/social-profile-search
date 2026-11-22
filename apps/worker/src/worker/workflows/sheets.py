@@ -11,14 +11,7 @@ import httpx
 SHEETS_BASE = "https://sheets.googleapis.com/v4/spreadsheets"
 DRIVE_BASE = "https://www.googleapis.com/drive/v3"
 
-CSV_HEADERS = [
-    "search_query", "platform", "account_id", "account_username",
-    "account_name", "account_description", "followers", "url", "relevant",
-]
-DASHBOARD_HEADERS = [
-    "target_id", "name", "platform", "searched", "accounts_returned",
-    "accounts_checked", "accounts_relevant", "cost_usd", "error", "updated_at",
-]
+from .models import CSV_HEADERS  # noqa: F401 (constants partagées)
 
 
 async def _get_access_token(client: httpx.AsyncClient) -> str:

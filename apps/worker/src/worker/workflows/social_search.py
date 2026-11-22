@@ -5,19 +5,15 @@
 - process-target (enfant): recherche sur chaque plateforme via Apify, vérifie la
   pertinence, écrit les résultats et l'état par plateforme.
 """
-import asyncio
-import httpx
 from datetime import datetime, timedelta
 
 import mistralai.workflows as workflows
 from pydantic import BaseModel, ConfigDict
 
-from .apify_client import search_profiles, VALID_PLATFORMS, get_usage_usd
-from .matching import is_relevant
-from .models import BatchParams, ProcessTargetParams, TargetInput, PerPlatformStatus
-from .sheets import (
-    CSV_HEADERS, SheetsClient, find_spreadsheet_id,
-)
+from .models import CSV_HEADERS, ProcessTargetParams, TargetInput, PerPlatformStatus
+
+# Les modules réseau (httpx, apify_client, sheets) sont importés SOUS les activités:
+# le sandbox de workflow interdit tout import module-level de code d'E/S.
 
 
 # --------------------------------------------------------------------------
@@ -30,6 +26,8 @@ from .sheets import (
 )
 async def fetch_targets(sheet_name: str, inputs_tab: str) -> list[TargetInput]:
     """Lit l'onglet Inputs du Google Sheet et le résout en TargetInput."""
+    from .sheets import find_spreadsheet_id, SheetsClient
+
     spreadsheet_id = await find_spreadsheet_id(sheet_name)
     sheets = SheetsClient(spreadsheet_id)
     rows = await sheets.read_inputs(inputs_tab)
@@ -51,6 +49,8 @@ async def fetch_targets(sheet_name: str, inputs_tab: str) -> list[TargetInput]:
 )
 async def fetch_usage_usd() -> float:
     """Coût Apify total engagé ce mois-ci."""
+    from .apify_client import get_usage_usd
+
     return await get_usage_usd()
 
 
@@ -60,7 +60,9 @@ async def fetch_usage_usd() -> float:
 )
 async def search_platform(platform: str, query: str) -> dict:
     """Une recherche de profils sur une plateforme (max 10 résultats, 1 page)."""
-    return await search_profiles(platform, query)
+    from .apify_client import search_platform as _search_platform
+
+    return await _search_platform(platform, query)
 
 
 @workflows.activity(
@@ -68,6 +70,8 @@ async def search_platform(platform: str, query: str) -> dict:
 )
 async def match_accounts(rows: list[dict], target: TargetInput) -> list[dict]:
     """Vérifie la pertinence de chaque compte et remplit la colonne relevant."""
+    from .matching import is_relevant
+
     out = []
     for account in rows:
         account["relevant"] = "TRUE" if is_relevant(account, target) else "FALSE"
@@ -81,6 +85,9 @@ async def match_accounts(rows: list[dict], target: TargetInput) -> list[dict]:
 )
 async def append_results_rows(sheet_name: str, results_tab: str, rows: list[list]) -> None:
     """Écrit les résultats dans l'onglet résultats du Sheet."""
+    import httpx
+    from .sheets import CSV_HEADERS, SheetsClient, find_spreadsheet_id
+
     spreadsheet_id = await find_spreadsheet_id(sheet_name)
     sheets = SheetsClient(spreadsheet_id)
     async with httpx.AsyncClient(timeout=60) as client:
@@ -93,6 +100,9 @@ async def append_results_rows(sheet_name: str, results_tab: str, rows: list[list
 )
 async def upsert_status(sheet_name: str, dashboard_tab: str, row: list) -> None:
     """Écrit une ligne d'état dans le dashboard du Sheet."""
+    import httpx
+    from .sheets import SheetsClient, find_spreadsheet_id
+
     spreadsheet_id = await find_spreadsheet_id(sheet_name)
     sheets = SheetsClient(spreadsheet_id)
     async with httpx.AsyncClient(timeout=60) as client:
@@ -179,6 +189,8 @@ class ParentParams(BaseModel):
 class SocialProfileSearchWorkflow:
     @workflows.workflow.entrypoint
     async def run(self, params: ParentParams) -> dict:
+        from .apify_client import VALID_PLATFORMS
+
         invalid = [p for p in params.platforms if p not in VALID_PLATFORMS]
         if invalid:
             raise ValueError(f"Plateformes non supportées: {invalid}. "
