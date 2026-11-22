@@ -53,8 +53,10 @@ class ProcessTargetParams(BaseModel):
     platforms: list[str]
 
 
-# Constantes de sortie (définies ici car pures: le sandbox de workflow interdit
-# d'importer les modules d'E/S depuis le code de workflow).
+# Constantes pures (définies ici car le sandbox de workflow interdit d'importer
+# les modules d'E/S, y compris les constantes qui y vivent).
+VALID_PLATFORMS = frozenset({"linkedin", "x", "bluesky", "instagram", "tiktok", "facebook"})
+
 CSV_HEADERS = [
     "search_query", "platform", "account_id", "account_username",
     "account_name", "account_description", "followers", "url", "relevant",

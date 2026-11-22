@@ -10,10 +10,10 @@ from datetime import datetime, timedelta
 import mistralai.workflows as workflows
 from pydantic import BaseModel, ConfigDict
 
-from .models import CSV_HEADERS, ProcessTargetParams, TargetInput, PerPlatformStatus
+from .models import CSV_HEADERS, VALID_PLATFORMS, ProcessTargetParams, TargetInput, PerPlatformStatus
 
 # Les modules réseau (httpx, apify_client, sheets) sont importés SOUS les activités:
-# le sandbox de workflow interdit tout import module-level de code d'E/S.
+# le sandbox de workflow interdit tout import de code d'E/S dans le code de workflow.
 
 
 # --------------------------------------------------------------------------
@@ -60,9 +60,9 @@ async def fetch_usage_usd() -> float:
 )
 async def search_platform(platform: str, query: str) -> dict:
     """Une recherche de profils sur une plateforme (max 10 résultats, 1 page)."""
-    from .apify_client import search_platform as _search_platform
+    from .apify_client import search_profiles
 
-    return await _search_platform(platform, query)
+    return await search_profiles(platform, query)
 
 
 @workflows.activity(
@@ -86,7 +86,7 @@ async def match_accounts(rows: list[dict], target: TargetInput) -> list[dict]:
 async def append_results_rows(sheet_name: str, results_tab: str, rows: list[list]) -> None:
     """Écrit les résultats dans l'onglet résultats du Sheet."""
     import httpx
-    from .sheets import CSV_HEADERS, SheetsClient, find_spreadsheet_id
+    from .sheets import SheetsClient, find_spreadsheet_id
 
     spreadsheet_id = await find_spreadsheet_id(sheet_name)
     sheets = SheetsClient(spreadsheet_id)
@@ -189,8 +189,6 @@ class ParentParams(BaseModel):
 class SocialProfileSearchWorkflow:
     @workflows.workflow.entrypoint
     async def run(self, params: ParentParams) -> dict:
-        from .apify_client import VALID_PLATFORMS
-
         invalid = [p for p in params.platforms if p not in VALID_PLATFORMS]
         if invalid:
             raise ValueError(f"Plateformes non supportées: {invalid}. "

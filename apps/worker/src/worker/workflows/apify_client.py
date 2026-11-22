@@ -11,6 +11,8 @@ import urllib.parse
 
 import httpx
 
+from .models import VALID_PLATFORMS
+
 APIFY_BASE = "https://api.apify.com/v2"
 ACTORS = {
     "linkedin": {
@@ -46,7 +48,6 @@ ACTORS = {
         "input": lambda q: {"searchQuery": q, "maxPages": 1},
     },
 }
-VALID_PLATFORMS = set(ACTORS.keys())
 
 
 def _props(item: dict) -> dict:
@@ -66,11 +67,12 @@ def _str(props: dict, *keys: str) -> str:
 
 async def _run_actor(client: httpx.AsyncClient, platform: str, query: str) -> dict:
     """Exécute un acteur de recherche de profils et normalise les résultats."""
+    if platform not in ACTORS:
+        raise ValueError(f"Plateforme non supportée: {platform}")
     spec = ACTORS[platform]
     run_input = spec["input"](query)
     token = os.environ["APIFY_TOKEN"]
 
-    # 1. Start a run synchronously (memory 1024 suffit pour 1 page)
     r = await client.post(
         f"{APIFY_BASE}/acts/{spec['actor_id']}/run-sync-get-dataset-items",
         params={"token": token, "memory": 1024, "timeout": 120},
@@ -98,7 +100,8 @@ async def _run_actor(client: httpx.AsyncClient, platform: str, query: str) -> di
 
 async def search_profiles(platform: str, query: str) -> dict:
     """Exécute une recherche de profils (max 10 résultats) et retourne les lignes CSV normalisées."""
-    assert platform in VALID_PLATFORMS, f"Plateforme non supportée: {platform}"
+    if platform not in VALID_PLATFORMS:
+        raise ValueError(f"Plateforme non supportée: {platform}")
     async with httpx.AsyncClient(timeout=180) as client:
         return await _run_actor(client, platform, query)
 
@@ -113,7 +116,6 @@ async def get_usage_usd() -> float:
         r.raise_for_status()
         data = r.json().get("data", {})
         usage = data.get("currentMonth", data)
-        # apify: usage in platform 'pay-as-you-go' cents
         return float(usage.get("totalAmount", 0)) / 100
 
 
