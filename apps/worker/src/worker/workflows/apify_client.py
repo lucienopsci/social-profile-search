@@ -6,9 +6,6 @@ Règles issues de la skill apify-api-usage:
 - aucune donnée fabriquée: uniquement ce qu'Apify retourne
 """
 import os
-import time
-import urllib.parse
-
 import httpx
 
 from .models import VALID_PLATFORMS
@@ -19,6 +16,7 @@ ACTORS = {
         "actor_id": "harvestapi~linkedin-profile-search-by-name",
         "input": lambda q: {
             "searchTerm": q,
+            "profileScraperMode": "Short",  # requis par le schéma de l'acteur
             "maxItems": 10,
             "maxPages": 1,
         },
@@ -50,6 +48,11 @@ ACTORS = {
 }
 
 
+def _auth_headers() -> dict:
+    """Token Apify en header (jamais en query param: il fuiterait dans les logs)."""
+    return {"Authorization": "Bearer " + os.environ["APIFY_TOKEN"]}
+
+
 def _props(item: dict) -> dict:
     """Apify renvoie parfois {item: {...}} ou l'objet directement."""
     if isinstance(item, dict) and isinstance(item.get("item"), dict):
@@ -65,20 +68,28 @@ def _str(props: dict, *keys: str) -> str:
     return ""
 
 
+def _raise_detail(r: httpx.Response, platform: str) -> None:
+    """Erreur explicite incluant le corps de réponse Apify."""
+    raise httpx.HTTPStatusError(
+        f"Apify {platform}: HTTP {r.status_code} - {r.text[:300]}", request=r.request, response=r
+    )
+
+
 async def _run_actor(client: httpx.AsyncClient, platform: str, query: str) -> dict:
     """Exécute un acteur de recherche de profils et normalise les résultats."""
     if platform not in ACTORS:
         raise ValueError(f"Plateforme non supportée: {platform}")
     spec = ACTORS[platform]
     run_input = spec["input"](query)
-    token = os.environ["APIFY_TOKEN"]
 
     r = await client.post(
         f"{APIFY_BASE}/acts/{spec['actor_id']}/run-sync-get-dataset-items",
-        params={"token": token, "memory": 1024, "timeout": 120},
+        params={"memory": 1024, "timeout": 120},
+        headers=_auth_headers(),
         json=run_input,
     )
-    r.raise_for_status()
+    if r.status_code >= 400:
+        _raise_detail(r, platform)
     items = r.json() or []
 
     rows = []
@@ -108,10 +119,9 @@ async def search_profiles(platform: str, query: str) -> dict:
 
 async def get_usage_usd() -> float:
     """Coût Apify engagé ce mois (USD) via l'API usage de l'utilisateur."""
-    token = os.environ["APIFY_TOKEN"]
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.get(
-            "https://api.apify.com/v2/users/me/usage/monthly", params={"token": token}
+            "https://api.apify.com/v2/users/me/usage/monthly", headers=_auth_headers()
         )
         r.raise_for_status()
         data = r.json().get("data", {})
@@ -122,10 +132,9 @@ async def get_usage_usd() -> float:
 async def actor_price_usd(platform: str) -> float:
     """Prix de lancement d'un acteur (estimation du coût par exécution)."""
     spec = ACTORS[platform]
-    token = os.environ["APIFY_TOKEN"]
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.get(
-            f"{APIFY_BASE}/acts/{spec['actor_id']}", params={"token": token}
+            f"{APIFY_BASE}/acts/{spec['actor_id']}", headers=_auth_headers()
         )
         r.raise_for_status()
         pricing = r.json().get("data", {}).get("pricing", [])
