@@ -206,13 +206,14 @@ class SocialProfileSearchWorkflow:
 
         # Exécution parallèle des enfants (auto continue-as-new au-delà des limites d'historique)
         child_items = [
-            {"params": ProcessTargetParams(
+            ProcessTargetParams(
                 target=t,
                 sheet_name=params.sheet_name,
                 platforms=params.platforms,
-            )}
+            )
             for t in targets
         ]
+
         results = await workflows.execute_activities_in_parallel(
             activity=run_target_child,
             items=child_items,
