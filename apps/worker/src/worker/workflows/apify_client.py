@@ -45,6 +45,10 @@ ACTORS = {
         "actor_id": "patient_discovery~facebook-search-people",
         "input": lambda q: {"searchQuery": q, "maxPages": 1},
     },
+    "youtube": {
+        "actor_id": "powerai~youtube-user-search-scraper",
+        "input": lambda q: {"searchKeyword": q, "maxResults": 10},
+    },
 }
 
 
@@ -98,12 +102,12 @@ async def _run_actor(client: httpx.AsyncClient, platform: str, query: str) -> di
         rows.append({
             "search_query": query,
             "platform": platform,
-            "account_id": _str(p, "id", "userId", "uid", "did"),
+            "account_id": _str(p, "id", "userId", "uid", "did", "channelId"),
             "account_username": _str(p, "username", "handle", "user", "userName"),
-            "account_name": _str(p, "fullName", "fullNameDecoded", "displayName", "name", "title"),
+            "account_name": _str(p, "fullName", "fullNameDecoded", "displayName", "name", "title", "channelTitle"),
             "account_description": _str(p, "bio", "description", "about", "headline", "summary"),
-            "followers": p.get("followersCount") or p.get("followers") or p.get("followerCount") or "",
-            "url": _str(p, "url", "profileUrl", "profile_url"),
+            "followers": p.get("followersCount") or p.get("followers") or p.get("followerCount") or p.get("subscriberCount") or "",
+            "url": _str(p, "url", "profileUrl", "profile_url", "channelUrl"),
             "relevant": "",
         })
     return {"platform": platform, "rows": rows[:10]}

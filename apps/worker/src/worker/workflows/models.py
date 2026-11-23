@@ -17,7 +17,7 @@ class BatchParams(BaseModel):
 
     sheet_name: str                 # nom du Google Sheet de sortie + dashboard
     inputs_tab: str = "Inputs"      # onglet où lire les cibles
-    platforms: list[str]            # subset de: linkedin, x, bluesky, instagram, tiktok, facebook
+    platforms: list[str]            # subset de: linkedin, x, bluesky, instagram, tiktok, facebook, youtube
     max_concurrency: int = 20        # cibles traitées en parallèle
     platforms_concurrency: int = 6  # plateformes appelées en parallèle par cible
 
@@ -57,7 +57,7 @@ class ProcessTargetParams(BaseModel):
 
 # Constantes pures (définies ici car le sandbox de workflow interdit d'importer
 # les modules d'E/S, y compris les constantes qui y vivent).
-VALID_PLATFORMS = frozenset({"linkedin", "x", "bluesky", "instagram", "tiktok", "facebook"})
+VALID_PLATFORMS = frozenset({"linkedin", "x", "bluesky", "instagram", "tiktok", "facebook", "youtube"})
 
 CSV_HEADERS = [
     "search_query", "platform", "account_id", "account_username",
