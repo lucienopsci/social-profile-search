@@ -11,9 +11,9 @@ import urllib.parse
 import httpx
 
 SHEETS_BASE = "https://sheets.googleapis.com/v4/spreadsheets"
-DRIVE_BASE = "https://www.googleapis.com/drive/v3"
+DRIVE_BASE = "https://www.googleapis.com/auth/drive"  # scope only; listing via drive v3 base
 
-from .models import CSV_HEADERS  # noqa: F401 (constants partagées)
+from .models import CSV_HEADERS, DASHBOARD_HEADERS  # noqa: F401 (constants partagées)
 
 _ID_RE = re.compile(r"^[A-Za-z0-9_-]{25,}$")
 
@@ -144,17 +144,58 @@ class SheetsClient:
             )
 
     async def upsert_dashboard(self, client: httpx.AsyncClient, tab: str, row: list):
-        """Ajoute une ligne au dashboard (append; une ligne par target_id x plateforme)."""
+        """Upsert réel d'une ligne dashboard, clé = (target_id, platform).
+
+        - si une ligne existe déjà pour (target_id, platform), elle est mise à jour en place
+        - sinon, la ligne est ajoutée à la fin de l'onglet
+        """
         real_tab = await self._resolve_tab(client, tab)
+        target_id = str(row[0]).strip() if len(row) > 0 else ""
+        platform = str(row[2]).strip() if len(row) > 2 else ""
+
+        # 1) lire les lignes existantes du dashboard
         r = await self._req(
-            client, "POST",
-            f"{SHEETS_BASE}/{self.id}/values/{_range(real_tab, 'A1')}:append",
-            params={"valueInputOption": "USER_ENTERED", "insertDataOption": "INSERT_ROWS"},
-            json={"values": [row]},
+            client, "GET",
+            f"{SHEETS_BASE}/{self.id}/values/{_range(real_tab, 'A2:J')}",
         )
         if r.status_code != 200:
             raise RuntimeError(
-                f"Impossible d'écrire dans l'onglet '{real_tab}' (HTTP {r.status_code}). "
+                f" Impossible de lire le dashboard '{real_tab}' (HTTP {r.status_code}). "
+                f"Réponse Google: {r.text[:300]}"
+            )
+        existing = r.json().get("values", [])
+
+        # 2) chercher la ligne correspondante (clé: colonnes A et C)
+        match_idx = None
+        for i, erow in enumerate(existing):
+            a = str(erow[0]).strip() if len(erow) > 0 else ""
+            c = str(erow[2]).strip() if len(erow) > 2 else ""
+            if a == target_id and c == platform:
+                match_idx = i
+                break
+
+        pad = lambda values: values + [""] * (len(DASHBOARD_HEADERS) - len(values))
+
+        if match_idx is not None:
+            # mise à jour en place: ligne sheet = index (0-based dans A2:J) + 2
+            sheet_row = match_idx + 2
+            r = await self._req(
+                client, "PUT",
+                f"{SHEETS_BASE}/{self.id}/values/{_range(real_tab, f'A{sheet_row}:J{sheet_row}')}",
+                params={"valueInputOption": "USER_ENTERED"},
+                json={"values": [pad(row)]},
+            )
+        else:
+            # ajout en fin d'onglet
+            r = await self._req(
+                client, "POST",
+                f"{SHEETS_BASE}/{self.id}/values/{_range(real_tab, 'A1')}:append",
+                params={"valueInputOption": "USER_ENTERED", "insertDataOption": "INSERT_ROWS"},
+                json={"values": [pad(row)]},
+            )
+        if r.status_code != 200:
+            raise RuntimeError(
+                f"Impossible d'écrire dans le dashboard '{real_tab}' (HTTP {r.status_code}). "
                 f"Réponse Google: {r.text[:300]}"
             )
 
@@ -170,7 +211,7 @@ async def find_spreadsheet_id(name_or_id: str) -> str:
     async with httpx.AsyncClient(timeout=30) as client:
         token = await _get_access_token(client)
         r = await client.get(
-            f"{DRIVE_BASE}/files",  # drive list endpoint
+            "https://www.googleapis.com/drive/v3/files",
             params={"q": f"name = '{name_or_id}' and mimeType = 'application/vnd.google-apps.spreadsheet'",
                     "fields": "files(id,name)"},
             headers={"Authorization": f"Bearer {token}"},
