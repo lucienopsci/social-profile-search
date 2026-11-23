@@ -5,6 +5,7 @@ Utilise l'API REST Google Sheets avec un compte de service (GOOGLE_SERVICE_ACCOU
 """
 import json
 import os
+import re
 
 import httpx
 
@@ -13,11 +14,12 @@ DRIVE_BASE = "https://www.googleapis.com/drive/v3"
 
 from .models import CSV_HEADERS  # noqa: F401 (constants partagées)
 
+_ID_RE = re.compile(r"^[A-Za-z0-9_-]{25,}$")
+
 
 async def _get_access_token(client: httpx.AsyncClient) -> str:
     """Échange un JWT fait depuis le compte de service contre un access token."""
     import time  # noqa: local import
-    from pathlib import Path
 
     creds = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
     # build JWT
@@ -90,7 +92,7 @@ class SheetsClient:
         )
 
     async def upsert_dashboard(self, client: httpx.AsyncClient, tab: str, row: list):
-        """Ajoute ou met à jour une ligne du dashboard (todo: map target_id+platform -> ligne)."""
+        """Ajoute une ligne au dashboard (append; une ligne par target_id x plateforme)."""
         await self._req(
             client, "POST",
             f"{SHEETS_BASE}/{self.id}/values/{tab}!A1:append",
@@ -99,18 +101,24 @@ class SheetsClient:
         )
 
 
-async def find_spreadsheet_id(name: str) -> str:
-    """Résout le nom du Sheet en ID via Drive."""
+async def find_spreadsheet_id(name_or_id: str) -> str:
+    """Résout un nom OU un ID de spreadsheet en ID.
+
+    Si la valeur ressemble à un ID (>= 25 chars alphanumériques/_-), l'utilise directement.
+    Sinon, recherche par nom via Drive.
+    """
+    if _ID_RE.match(name_or_id or ""):
+        return name_or_id
     async with httpx.AsyncClient(timeout=30) as client:
         token = await _get_access_token(client)
         r = await client.get(
             f"{DRIVE_BASE}/files",  # drive list endpoint
-            params={"q": f"name = '{name}' and mimeType = 'application/vnd.google-apps.spreadsheet'",
+            params={"q": f"name = '{name_or_id}' and mimeType = 'application/vnd.google-apps.spreadsheet'",
                     "fields": "files(id,name)"},
             headers={"Authorization": f"Bearer {token}"},
         )
         r.raise_for_status()
         files = r.json().get("files", [])
         if not files:
-            raise FileNotFoundError(f"Aucun Google Sheet nommé '{name}' n'est accessible")
+            raise FileNotFoundError(f"Aucun Google Sheet nommé ou accessible via '{name_or_id}'")
         return files[0]["id"]
