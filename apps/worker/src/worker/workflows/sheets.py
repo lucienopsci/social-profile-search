@@ -2,6 +2,7 @@
 
 Utilise l'API REST Google Sheets avec un compte de service (GOOGLE_SERVICE_ACCOUNT_JSON)
 - fichier de clé JSON stocké dans le secret du même nom.
+Les onglets results/dashboard manquants sont créés automatiquement (avec en-têtes).
 """
 import json
 import os
@@ -11,9 +12,8 @@ import urllib.parse
 import httpx
 
 SHEETS_BASE = "https://sheets.googleapis.com/v4/spreadsheets"
-DRIVE_BASE = "https://www.googleapis.com/auth/drive"  # scope only; listing via drive v3 base
 
-from .models import CSV_HEADERS, DASHBOARD_HEADERS  # noqa: F401 (constants partagées)
+from .models import CSV_HEADERS, DASHBOARD_HEADERS
 
 _ID_RE = re.compile(r"^[A-Za-z0-9_-]{25,}$")
 
@@ -21,10 +21,9 @@ _ID_RE = re.compile(r"^[A-Za-z0-9_-]{25,}$")
 async def _get_access_token(client: httpx.AsyncClient) -> str:
     """Échange un JWT fait depuis le compte de service contre un access token."""
     import time  # noqa: local import
+    import base64
 
     creds = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
-    # build JWT
-    import base64
 
     def b64(d: bytes) -> str:
         return base64.urlsafe_b64encode(d).rstrip(b"=").decode()
@@ -38,7 +37,7 @@ async def _get_access_token(client: httpx.AsyncClient) -> str:
         "iat": now,
         "exp": now + 3600,
     }).encode())
-    # sign with the private key (RS256) via cryptography
+    # signature RS256 via cryptography
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import padding
 
@@ -74,7 +73,7 @@ class SheetsClient:
     async def _req(self, client: httpx.AsyncClient, method: str, url: str, **kw):
         headers = await self._headers(client)
         r = await client.request(method, url, headers=headers, **kw)
-        if r.status_code == 401:  # token expired
+        if r.status_code == 401:  # token expiré: retry une fois
             self._token = None
             headers = await self._headers(client)
             r = await client.request(method, url, headers=headers, **kw)
@@ -85,7 +84,6 @@ class SheetsClient:
         return (s or "").strip().lower().replace(" ", "")
 
     async def _list_tabs(self, client: httpx.AsyncClient) -> list[str]:
-        """Liste les titres d'onglets, pour des messages d'erreur exploitables."""
         r = await self._req(
             client, "GET", f"{SHEETS_BASE}/{self.id}", params={"fields": "sheets.properties.title"}
         )
@@ -95,10 +93,7 @@ class SheetsClient:
         return []
 
     async def _resolve_tab(self, client: httpx.AsyncClient, tab: str) -> str:
-        """Retourne le titre réel de l'onglet, insensible à la casse et aux espaces.
-
-        Tolère aussi les variantes de nombre (Input/Inputs, Dashboard/Dashboard).
-        """
+        """Titre réel de l'onglet, insensible casse/espaces, tolérant aux préfixes."""
         if self._tab_map is None:
             self._tab_map = {}
             for t in await self._list_tabs(client):
@@ -113,10 +108,43 @@ class SheetsClient:
             f"Onglet '{tab}' introuvable. Onglets disponibles: {list(self._tab_map.values())}"
         )
 
+    async def _create_tab(self, client: httpx.AsyncClient, tab: str, headers: list[str]) -> str:
+        """Crée l'onglet via batchUpdate et écrit sa ligne d'en-têtes."""
+        r = await self._req(
+            client, "POST", f"{SHEETS_BASE}/{self.id}:batchUpdate",
+            json={"requests": [{"addSheet": {"properties": {"title": tab}}}]},
+        )
+        if r.status_code >= 400:
+            raise RuntimeError(
+                f"Impossible de créer l'onglet '{tab}' (HTTP {r.status_code}). "
+                f"Réponse Google: {r.text[:300]}"
+            )
+        rw = await self._req(
+            client, "PUT",
+            f"{SHEETS_BASE}/{self.id}/values/{_range(tab, 'A1')}",
+            params={"valueInputOption": "USER_ENTERED"},
+            json={"values": [headers]},
+        )
+        if rw.status_code >= 400:
+            raise RuntimeError(
+                f"Impossible d'écrire les en-têtes de '{tab}' (HTTP {rw.status_code}). "
+                f"Réponse Google: {rw.text[:300]}"
+            )
+        if self._tab_map is not None:
+            self._tab_map[self._norm(tab)] = tab
+        return tab
+
+    async def ensure_tab(self, client: httpx.AsyncClient, tab: str, headers: list[str]) -> str:
+        """Retourne le titre réel de l'onglet, en le créant avec en-têtes s'il est absent."""
+        try:
+            return await self._resolve_tab(client, tab)
+        except RuntimeError:
+            return await self._create_tab(client, tab, headers)
+
     async def read_inputs(self, tab: str) -> list[list]:
         """Lit l'onglet inputs: colonnes target_id, name, description."""
         async with httpx.AsyncClient(timeout=60) as client:
-            real_tab = await self._resolve_tab(client, tab)
+            real_tab = await self.ensure_tab(client, tab, ["target_id", "name", "description"])
             r = await self._req(
                 client, "GET",
                 f"{SHEETS_BASE}/{self.id}/values/{_range(real_tab, 'A2:C')}",
@@ -130,7 +158,7 @@ class SheetsClient:
 
     async def append_results(self, client: httpx.AsyncClient, tab: str, rows: list[list]):
         """Ajoute les comptes trouvés (colonnes CSV_HEADERS + TRUE/FALSE) à l'onglet résultats."""
-        real_tab = await self._resolve_tab(client, tab)
+        real_tab = await self.ensure_tab(client, tab, CSV_HEADERS)
         r = await self._req(
             client, "POST",
             f"{SHEETS_BASE}/{self.id}/values/{_range(real_tab, 'A1')}:append",
@@ -149,7 +177,7 @@ class SheetsClient:
         - si une ligne existe déjà pour (target_id, platform), elle est mise à jour en place
         - sinon, la ligne est ajoutée à la fin de l'onglet
         """
-        real_tab = await self._resolve_tab(client, tab)
+        real_tab = await self.ensure_tab(client, tab, DASHBOARD_HEADERS)
         target_id = str(row[0]).strip() if len(row) > 0 else ""
         platform = str(row[2]).strip() if len(row) > 2 else ""
 
@@ -160,7 +188,7 @@ class SheetsClient:
         )
         if r.status_code != 200:
             raise RuntimeError(
-                f" Impossible de lire le dashboard '{real_tab}' (HTTP {r.status_code}). "
+                f"Impossible de lire le dashboard '{real_tab}' (HTTP {r.status_code}). "
                 f"Réponse Google: {r.text[:300]}"
             )
         existing = r.json().get("values", [])
