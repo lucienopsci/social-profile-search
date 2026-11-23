@@ -6,6 +6,7 @@ Utilise l'API REST Google Sheets avec un compte de service (GOOGLE_SERVICE_ACCOU
 import json
 import os
 import re
+import urllib.parse
 
 import httpx
 
@@ -53,6 +54,12 @@ async def _get_access_token(client: httpx.AsyncClient) -> str:
     return r.json()["access_token"]
 
 
+def _range(tab: str, a1: str) -> str:
+    """Construit un range A1 encodé pour l'URL, nom d'onglet toujours entre guillemets."""
+    quoted = "'" + tab.replace("'", "''") + "'"
+    return urllib.parse.quote(f"{quoted}!{a1}")
+
+
 class SheetsClient:
     def __init__(self, spreadsheet_id: str):
         self.id = spreadsheet_id
@@ -72,33 +79,59 @@ class SheetsClient:
             r = await client.request(method, url, headers=headers, **kw)
         return r
 
+    async def _list_tabs(self, client: httpx.AsyncClient) -> list[str]:
+        """Liste les titres d'onglets, pour des messages d'erreur exploitables."""
+        r = await self._req(
+            client, "GET", f"{SHEETS_BASE}/{self.id}", params={"fields": "sheets.properties.title"}
+        )
+        if r.status_code == 200:
+            data = r.json().get("sheets", [])
+            return [s.get("properties", {}).get("title", "?") for s in data]
+        return []
+
     async def read_inputs(self, tab: str) -> list[list]:
         """Lit l'onglet Inputs: colonnes target_id, name, description."""
         async with httpx.AsyncClient(timeout=60) as client:
             r = await self._req(
                 client, "GET",
-                f"{SHEETS_BASE}/{self.id}/values/{tab}!A2:C",
+                f"{SHEETS_BASE}/{self.id}/values/{_range(tab, 'A2:C')}",
             )
-            r.raise_for_status()
+            if r.status_code != 200:
+                tabs = await self._list_tabs(client)
+                raise RuntimeError(
+                    f"Impossible de lire l'onglet '{tab}' (HTTP {r.status_code}). "
+                    f"Réponse Google: {r.text[:300]}. "
+                    f"Onglets du Sheet: {tabs}"
+                )
             return r.json().get("values", [])
 
     async def append_results(self, client: httpx.AsyncClient, tab: str, rows: list[list]):
         """Ajoute les comptes trouvés (colonnes CSV_HEADERS + TRUE/FALSE) à l'onglet résultats."""
-        await self._req(
+        r = await self._req(
             client, "POST",
-            f"{SHEETS_BASE}/{self.id}/values/{tab}!A1:append",
+            f"{SHEETS_BASE}/{self.id}/values/{_range(tab, 'A1')}:append",
             params={"valueInputOption": "USER_ENTERED", "insertDataOption": "INSERT_ROWS"},
             json={"values": rows},
         )
+        if r.status_code != 200:
+            raise RuntimeError(
+                f"Impossible d'écrire dans l'onglet '{tab}' (HTTP {r.status_code}). "
+                f"Réponse Google: {r.text[:300]}"
+            )
 
     async def upsert_dashboard(self, client: httpx.AsyncClient, tab: str, row: list):
         """Ajoute une ligne au dashboard (append; une ligne par target_id x plateforme)."""
-        await self._req(
+        r = await self._req(
             client, "POST",
-            f"{SHEETS_BASE}/{self.id}/values/{tab}!A1:append",
+            f"{SHEETS_BASE}/{self.id}/values/{_range(tab, 'A1')}:append",
             params={"valueInputOption": "USER_ENTERED", "insertDataOption": "INSERT_ROWS"},
             json={"values": [row]},
         )
+        if r.status_code != 200:
+            raise RuntimeError(
+                f"Impossible d'écrire dans l'onglet '{tab}' (HTTP {r.status_code}). "
+                f"Réponse Google: {r.text[:300]}"
+            )
 
 
 async def find_spreadsheet_id(name_or_id: str) -> str:
