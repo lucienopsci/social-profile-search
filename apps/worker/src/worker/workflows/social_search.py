@@ -217,7 +217,6 @@ class SocialProfileSearchWorkflow:
             activity=run_target_child,
             items=child_items,
             max_concurrent_scheduled_tasks=params.max_concurrent_targets,
-            execution_timeout=timedelta(hours=6),
         )
 
         usage_end = await fetch_usage_usd()
