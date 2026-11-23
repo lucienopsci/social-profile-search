@@ -34,13 +34,15 @@ class TargetStatus(BaseModel):
     cost_usd: float = 0.0           # coût Apify engagé pour cette cible
     error: str = ""
 
+
 class PerPlatformStatus(BaseModel):
+    """État d'une cible sur une plateforme (valeurs par défaut: branchage erreur)."""
     platform: str
-    searched: bool
-    accounts_returned: int
-    accounts_checked: int
-    accounts_relevant: int
-    cost_usd: float
+    searched: bool = False
+    accounts_returned: int = 0
+    accounts_checked: int = 0
+    accounts_relevant: int = 0
+    cost_usd: float = 0.0
     error: str = ""
 
 
