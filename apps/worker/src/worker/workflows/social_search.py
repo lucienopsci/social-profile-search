@@ -2,6 +2,7 @@
 
 - social-profile-search (parent): lit les cibles dans le Google Sheet, découpe en lots,
   traite chaque cible via le workflow enfant, tient le dashboard de suivi.
+  Plateformes vides = mode préparation: crée les onglets results/dashboard, aucune recherche Apify.
 - process-target (enfant): recherche sur chaque plateforme via Apify, vérifie la
   pertinence, écrit les résultats et l'état par plateforme.
 """
@@ -11,9 +12,6 @@ import mistralai.workflows as workflows
 from pydantic import BaseModel, ConfigDict
 
 from .models import CSV_HEADERS, VALID_PLATFORMS, ProcessTargetParams, TargetInput, PerPlatformStatus
-
-# Les modules réseau (httpx, apify_client, sheets) sont importés SOUS les activités:
-# le sandbox de workflow interdit tout import de code d'E/S dans le code de workflow.
 
 
 # --------------------------------------------------------------------------
@@ -41,6 +39,23 @@ async def fetch_targets(sheet_name: str, inputs_tab: str) -> list[TargetInput]:
         if name:
             targets.append(TargetInput(target_id=target_id, name=name, description=desc))
     return targets
+
+
+@workflows.activity(
+    start_to_close_timeout=timedelta(minutes=2),
+    retry_policy_max_attempts=3,
+)
+async def prepare_sheet(sheet_name: str) -> dict:
+    """Crée les onglets results/dashboard avec en-têtes s'ils manquent (aucune recherche)."""
+    import httpx
+    from .sheets import SheetsClient, find_spreadsheet_id
+
+    spreadsheet_id = await find_spreadsheet_id(sheet_name)
+    sheets = SheetsClient(spreadsheet_id)
+    async with httpx.AsyncClient(timeout=60) as client:
+        results_tab = await sheets.ensure_tab(client, "Results", list(CSV_HEADERS))
+        dashboard_tab = await sheets.ensure_tab(client, "Dashboard", list(DASHBOARD_HEADERS))
+    return {"results_tab": results_tab, "dashboard_tab": dashboard_tab}
 
 
 @workflows.activity(
@@ -175,7 +190,7 @@ class ParentParams(BaseModel):
 
     sheet_name: str
     inputs_tab: str = "Inputs"
-    platforms: list[str]
+    platforms: list[str]  # vide = mode préparation (création des onglets, aucune recherche)
     max_concurrent_targets: int = 20
 
 
@@ -189,12 +204,19 @@ class ParentParams(BaseModel):
 class SocialProfileSearchWorkflow:
     @workflows.workflow.entrypoint
     async def run(self, params: ParentParams) -> dict:
+        if not params.platforms:
+            # Mode préparation: crée les onglets results/dashboard, aucun appel Apify.
+            prepared = await prepare_sheet(sheet_name=params.sheet_name)
+            return {
+                "prepared": True,
+                "results_tab": prepared["results_tab"],
+                "dashboard_tab": prepared["dashboard_tab"],
+                "message": "Onglets results/dashboard prêts. Aucune recherche lancée.",
+            }
         invalid = [p for p in params.platforms if p not in VALID_PLATFORMS]
         if invalid:
             raise ValueError(f"Plateformes non supportées: {invalid}. "
                              f"Valides: {sorted(VALID_PLATFORMS)}")
-        if not params.platforms:
-            raise ValueError("Aucune plateforme fournie: préciser au moins une plateforme.")
 
         usage_start = await fetch_usage_usd()
 
@@ -203,6 +225,9 @@ class SocialProfileSearchWorkflow:
         )
         if not targets:
             return {"processed": 0, "message": "Aucune cible trouvée dans l'onglet Inputs"}
+
+        # Onglets de sortie garantis présents avant le batch.
+        await prepare_sheet(sheet_name=params.sheet_name)
 
         # Exécution parallèle des enfants (auto continue-as-new au-delà des limites d'historique)
         child_items = [
@@ -213,7 +238,6 @@ class SocialProfileSearchWorkflow:
             )
             for t in targets
         ]
-
         results = await workflows.execute_activities_in_parallel(
             activity=run_target_child,
             items=child_items,
