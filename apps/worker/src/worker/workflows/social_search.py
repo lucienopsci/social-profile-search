@@ -397,7 +397,7 @@ class SocialProfileSearchWorkflow:
             )
             csv_rows: list[list] = []
             status_rows: list[list] = []
-            now = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+            # horodatage rempli par l'activité write_wave (datetime interdit dans le workflow)
             for child, res in zip(chunk, wave_results):
                 if res is None:
                     all_failures += 1
@@ -412,7 +412,7 @@ class SocialProfileSearchWorkflow:
                         st.get("accounts_checked", 0),
                         st.get("accounts_relevant", 0),
                         round(st.get("cost_usd", 0.0) or 0.0, 4),
-                        st.get("error", ""), now,
+                        st.get("error", ""), "",
                     ])
             if csv_rows or status_rows:
                 w = await write_wave(
@@ -448,6 +448,11 @@ async def write_wave(sheet_name: str, csv_rows: list[list], status_rows: list[li
     import httpx
     from .sheets import SheetsClient, find_spreadsheet_id
 
+    now = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    for row in status_rows:
+        if len(row) < 10 or not row[9]:
+            row += [""] * (10 - len(row))
+            row[9] = now
     spreadsheet_id = await find_spreadsheet_id(sheet_name)
     sheets = SheetsClient(spreadsheet_id)
     async with httpx.AsyncClient(timeout=300) as client:
