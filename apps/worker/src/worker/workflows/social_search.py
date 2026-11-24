@@ -1,12 +1,13 @@
 """Workflows de recherche et vérification de comptes sociaux par lots.
 
-- social-profile-search (parent): lit les cibles dans le Google Sheet; YouTube est
-  recherché PAR LOT (apidojo, ~100 mots-clés par run, attribution par search_query)
-  avec repli individuel par cible si le lot échoue; les autres plateformes sont
-  traitées par le workflow enfant; dashboard de suivi dans le Sheet.
+- social-profile-search (parent): lit les cibles dans le Google Sheet; YouTube et
+  TikTok sont recherchés PAR LOT (respectivement apidojo et clockworks, ~100
+  mots-clés par run, attribution par search_query) avec repli individuel par cible
+  si le lot échoue; les autres plateformes sont traitées par le workflow enfant;
+  dashboard de suivi dans le Sheet.
   Plateformes vides = mode préparation: crée les onglets results/dashboard, aucune recherche Apify.
-- process-target (enfant): recherche sur chaque plateforme via Apify, vérifie la
-  pertinence, écrit les résultats et l'état par plateforme.
+- process-target (enfant): recherche sur chaque plateforme via Apify (sauf lignes
+  pré-cherchées par le parent), vérifie la pertinence, écrit les résultats et l'état.
 """
 from datetime import datetime, timedelta
 
@@ -14,9 +15,11 @@ import mistralai.workflows as workflows
 from pydantic import BaseModel, ConfigDict
 
 from .models import (
+    BATCHED_PLATFORMS,
     CSV_HEADERS,
     DASHBOARD_HEADERS,
     VALID_PLATFORMS,
+    BatchSearchParams,
     ProcessTargetParams,
     TargetInput,
     PerPlatformStatus,
@@ -93,14 +96,14 @@ async def search_platform(platform: str, query: str) -> dict:
     start_to_close_timeout=timedelta(minutes=12),
     retry_policy_max_attempts=2,
 )
-async def search_youtube_batch(keywords: list[str]) -> dict:
-    """Recherche youtube pour un lot de mots-clés (mise par le parent).
+async def search_platform_batch(params: BatchSearchParams) -> dict:
+    """Recherche par lot pour une plateforme batchée (mise par le parent).
 
     Retourne {rows:[{search_query...}], unattributed:int, missing_keywords:[...]}.
     """
-    from .apify_client import search_channels_batch
+    from .apify_client import search_profiles_batch
 
-    return await search_channels_batch(keywords)
+    return await search_profiles_batch(params.platform, params.keywords)
 
 
 @workflows.activity(
@@ -164,9 +167,12 @@ class ProcessTargetWorkflow:
         all_rows: list[list] = []
 
         for platform in params.platforms:
-            # youtube: si le parent a fourni les lignes du lot, pas de recherche individuelle
-            if platform == "youtube" and params.youtube_rows is not None:
-                matched = await match_accounts(rows=params.youtube_rows, target=t)
+            # lignes pré-cherchées par le parent (lot youtube/tiktok): pas de recherche
+            pre = None
+            if params.precomputed_rows:
+                pre = params.precomputed_rows.get(platform)
+            if pre is not None:
+                matched = await match_accounts(rows=pre, target=t)
                 for acc in matched:
                     all_rows.append([acc.get(k, "") for k in CSV_HEADERS])
                 n_rel = sum(1 for a in matched if a["relevant"] == "TRUE")
@@ -227,16 +233,16 @@ class ParentParams(BaseModel):
     inputs_tab: str = "Inputs"
     platforms: list[str]  # vide = mode préparation (création des onglets, aucune recherche)
     max_concurrent_targets: int = 5   # cibles (child workflows) en parallèle
-    max_concurrent_batches: int = 3  # lots youtube en parallèle
-    youtube_batch_size: int = 100    # mots-clés youtube par run apidojo
+    max_concurrent_batches: int = 3  # lots (youtube/tiktok) en parallèle
+    batch_size: int = 100            # mots-clés par run de lot (youtube/tiktok)
 
 
 @workflows.workflow.define(
     name="social-profile-search",
     workflow_display_name="Recherche de comptes sociaux (batch)",
     workflow_description=("Lit les cibles dans un Google Sheet, recherche les comptes "
-                          "sur les plateformes via Apify (youtube par lot), vérifie la "
-                          "pertinence, écrit les résultats et le dashboard de suivi."),
+                          "sur les plateformes via Apify (youtube/tiktok par lot), vérifie "
+                          "la pertinence, écrit les résultats et le dashboard de suivi."),
 )
 class SocialProfileSearchWorkflow:
     @workflows.workflow.entrypoint
@@ -267,49 +273,55 @@ class SocialProfileSearchWorkflow:
         await prepare_sheet(sheet_name=params.sheet_name)
 
         # ------------------------------------------------------------------
-        # YouTube: recherche par lot (attribution par search_query)
+        # Plateformes batchées (youtube, tiktok): recherche par lot + attribution
         # ------------------------------------------------------------------
-        has_yt = "youtube" in params.platforms
-        # rows par nom de cible (normalisé) ; None = pas de données → le child
-        # refera une recherche youtube individuelle (repli).
-        yt_rows: dict[str, list[dict]] = {}
-        batch_stats = {"batches": 0, "batch_failed": 0, "unattributed": 0, "fallback_targets": 0}
-        if has_yt:
-            size = max(1, params.youtube_batch_size)
-            batches = [targets[i:i + size] for i in range(0, len(targets), size)]
-            keywords_batches: list[list[str]] = []
-            items: list[ProcessTargetParams] = []
-            keyword_items = [[t.name for t in b] for b in batches]
-            batch_results = await workflows.execute_activities_in_parallel(
-                activity=search_youtube_batch,
-                items=keyword_items,
+        batched = [p for p in params.platforms if p in BATCHED_PLATFORMS]
+        size = max(1, params.batch_size)
+        batches = [targets[i:i + size] for i in range(0, len(targets), size)]
+
+        # rows par plateforme, puis par nom de cible (search_query)
+        precomputed: dict[str, dict[str, list[dict]]] = {p: {} for p in batched}
+        batch_stats: dict[str, dict] = {}
+        for platform in batched:
+            items = [
+                BatchSearchParams(platform=platform, keywords=[t.name for t in b])
+                for b in batches
+            ]
+            results = await workflows.execute_activities_in_parallel(
+                activity=search_platform_batch,
+                items=items,
                 max_concurrent_scheduled_tasks=max(1, params.max_concurrent_batches),
             )
-            for batch, res in zip(batches, batch_results):
-                batch_stats["batches"] += 1
+            stats = {"batches": len(batches), "batch_failed": 0,
+                     "unattributed": 0, "fallback_targets": 0}
+            for b, res in zip(batches, results):
                 if res is None:
                     # lot échoué: repli individuel pour toutes ses cibles
-                    batch_stats["batch_failed"] += 1
-                    batch_stats["fallback_targets"] += len(batch)
+                    stats["batch_failed"] += 1
+                    stats["fallback_targets"] += len(b)
                     continue
-                batch_stats["unattributed"] += res.get("unattributed", 0)
-                missing = set(res.get("missing_keywords", []))
+                stats["unattributed"] += res.get("unattributed", 0)
                 for row in res.get("rows", []):
-                    yt_rows.setdefault(row["search_query"], []).append(row)
-                for t in batch:
-                    if t.name in missing and t.name not in yt_rows:
-                        # aucune ligne attribuée pour cette cible → repli individuel
-                        batch_stats["fallback_targets"] += 1
+                    precomputed[platform].setdefault(row["search_query"], []).append(row)
+            # cibles sans aucune ligne attribuée dans ce lot -> repli individuel
+            for t in targets:
+                if t.name not in precomputed[platform]:
+                    stats["fallback_targets"] += 1
+            batch_stats[platform] = stats
 
         # ------------------------------------------------------------------
-        # Plateformes: enfant par cible (youtube: lignes du lot transmises)
+        # Plateformes: enfant par cible (lignes de lot transmises si dispo)
         # ------------------------------------------------------------------
         child_items = [
             ProcessTargetParams(
                 target=t,
                 sheet_name=params.sheet_name,
                 platforms=params.platforms,
-                youtube_rows=yt_rows.get(t.name) if has_yt and t.name in yt_rows else None,
+                precomputed_rows={
+                    p: precomputed[p][t.name]
+                    for p in batched
+                    if t.name in precomputed[p]
+                } or None,
             )
             for t in targets
         ]
@@ -324,15 +336,14 @@ class SocialProfileSearchWorkflow:
             (r or {}).get("total_relevant", 0) for r in results if r
         )
         failures = sum(1 for r in results if r is None)
-        out = {
+        return {
             "targets": len(targets),
             "processed": len(results) - failures,
             "failed": failures,
             "accounts_relevant_total": total_relevant,
             "apify_usage_usd": round(usage_end - usage_start, 4),
-            "youtube_batch": batch_stats,
+            "batch_stats": batch_stats,
         }
-        return out
 
 
 @workflows.activity(
