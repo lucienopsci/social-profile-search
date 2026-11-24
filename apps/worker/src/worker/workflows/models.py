@@ -59,7 +59,7 @@ class ProcessTargetParams(BaseModel):
 # Constantes pures (définies ici car le sandbox de workflow interdit d'importer
 # les modules d'E/S, y compris les constantes qui y vivent).
 VALID_PLATFORMS = frozenset({"linkedin", "x", "bluesky", "instagram", "tiktok", "facebook", "youtube"})
-BATCHED_PLATFORMS = frozenset({"youtube", "tiktok"})
+BATCHED_PLATFORMS = frozenset({"tiktok"})
 
 CSV_HEADERS = [
     "search_query", "platform", "account_id", "account_username",
