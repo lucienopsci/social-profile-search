@@ -296,14 +296,13 @@ class SocialProfileSearchWorkflow:
                      "unattributed": 0, "fallback_targets": 0}
             for b, res in zip(batches, results):
                 if res is None:
-                    # lot échoué: repli individuel pour toutes ses cibles
+                    # lot échoué: ses cibles seront comptées en repli par la boucle finale
                     stats["batch_failed"] += 1
-                    stats["fallback_targets"] += len(b)
                     continue
                 stats["unattributed"] += res.get("unattributed", 0)
                 for row in res.get("rows", []):
                     precomputed[platform].setdefault(row["search_query"], []).append(row)
-            # cibles sans aucune ligne attribuée dans ce lot -> repli individuel
+            # cibles sans aucune ligne attribuée (lot échoué inclus) -> repli individuel
             for t in targets:
                 if t.name not in precomputed[platform]:
                     stats["fallback_targets"] += 1
