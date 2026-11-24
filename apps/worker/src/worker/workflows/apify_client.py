@@ -186,10 +186,10 @@ async def search_profiles_batch(platform: str, keywords: list[str]) -> dict:
     spec = BATCH_SEARCH_ACTORS[platform]
     run_input = spec["input"](keywords)
 
-    async with httpx.AsyncClient(timeout=600) as client:
+    async with httpx.AsyncClient(timeout=1200) as client:
         r = await client.post(
             f"{APIFY_BASE}/acts/{spec['actor_id']}/run-sync-get-dataset-items",
-            params={"memory": 1024, "timeout": 300},
+            params={"memory": 2048, "timeout": 900},
             headers=_auth_headers(),
             json=run_input,
         )

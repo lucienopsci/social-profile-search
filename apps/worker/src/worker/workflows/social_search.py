@@ -93,17 +93,27 @@ async def search_platform(platform: str, query: str) -> dict:
 
 
 @workflows.activity(
-    start_to_close_timeout=timedelta(minutes=12),
+    start_to_close_timeout=timedelta(minutes=40),
     retry_policy_max_attempts=2,
 )
 async def search_platform_batch(params: BatchSearchParams) -> dict:
     """Recherche par lot pour une plateforme batchée (mise par le parent).
 
     Retourne {rows:[{search_query...}], unattributed:int, missing_keywords:[...]}.
+    Un lot en échec ne fait PAS échouer le run: il retourne failed=<erreur> et
+    les cibles concernées basculent en repli individuel côté parent.
     """
     from .apify_client import search_profiles_batch
 
-    return await search_profiles_batch(params.platform, params.keywords)
+    try:
+        return await search_profiles_batch(params.platform, params.keywords)
+    except Exception as e:  # lot échoué -> repli individuel par cible
+        return {
+            "rows": [],
+            "unattributed": 0,
+            "missing_keywords": list(params.keywords),
+            "failed": str(e)[:300],
+        }
 
 
 @workflows.activity(
@@ -357,7 +367,7 @@ class SocialProfileSearchWorkflow:
             stats = {"batches": len(batches), "batch_failed": 0,
                      "unattributed": 0, "fallback_targets": 0}
             for b, res in zip(batches, results):
-                if res is None:
+                if res is None or res.get("failed"):
                     # lot échoué: ses cibles seront comptées en repli par la boucle finale
                     stats["batch_failed"] += 1
                     continue
