@@ -46,8 +46,10 @@ ACTORS = {
         "input": lambda q: {"searchQuery": q, "maxPages": 1},
     },
     "youtube": {
+        # champ reel du schema: "keywords" (array). "searchKeyword" etait ignore,
+        # l'acteur retournait alors sa valeur par defaut ["MrBeast"].
         "actor_id": "powerai~youtube-user-search-scraper",
-        "input": lambda q: {"searchKeyword": q, "maxResults": 10},
+        "input": lambda q: {"keywords": [q], "maxItems": 10},
     },
 }
 
