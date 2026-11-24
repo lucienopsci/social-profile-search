@@ -187,6 +187,83 @@ class SheetsClient:
                 )
             return r.json().get("values", [])
 
+    async def purge_platform_rows(self, client: httpx.AsyncClient, tab: str, headers: list[str], platform: str) -> dict:
+        """Supprime d'un onglet toutes les lignes dont la colonne 'platform' == platform.
+
+        Réécrit tout l'onglet (clear + headers + lignes conservées).
+        Retourne {"total": lignes de données avant, "removed": lignes supprimées}.
+        """
+        real_tab = await self.ensure_tab(client, tab, headers)
+        r = await self._req(
+            client, "GET",
+            f"{SHEETS_BASE}/{self.id}/values/{_range(real_tab, 'A1:Z')}",
+        )
+        if r.status_code != 200:
+            raise RuntimeError(
+                f"Impossible de lire l'onglet '{real_tab}' (HTTP {r.status_code}). "
+                f"Réponse Google: {r.text[:300]}"
+            )
+        values = r.json().get("values", [])
+        if not values:
+            return {"total": 0, "removed": 0}
+        if "platform" not in headers:
+            raise RuntimeError(f"L'onglet '{real_tab}' n'a pas de colonne 'platform'")
+        col = headers.index("platform")
+
+        def norm_row(row: list) -> list:
+            row = [("" if v is None else str(v)) for v in row]
+            return (row + [""] * len(headers))[:len(headers)]
+
+        data = [norm_row(row) for row in values[1:]]
+        kept = [row for row in data if row[col].strip().lower() != platform.strip().lower()]
+        removed = len(data) - len(kept)
+
+        # 1) vider l'onglet
+        r = await self._req(
+            client, "POST",
+            f"{SHEETS_BASE}/{self.id}/values/{_range(real_tab, 'A:Z')}:clear",
+        )
+        if r.status_code != 200:
+            raise RuntimeError(
+                f"Impossible de vider l'onglet '{real_tab}' (HTTP {r.status_code}). "
+                f"Réponse Google: {r.text[:300]}"
+            )
+        # 2) réécrire en-têtes + lignes conservées
+        body = [list(headers)] + kept
+        r = await self._req(
+            client, "PUT",
+            f"{SHEETS_BASE}/{self.id}/values/{_range(real_tab, 'A1')}",
+            params={"valueInputOption": "USER_ENTERED"},
+            json={"values": body},
+        )
+        if r.status_code != 200:
+            raise RuntimeError(
+                f"Impossible de réécrire l'onglet '{real_tab}' (HTTP {r.status_code}). "
+                f"Réponse Google: {r.text[:300]}"
+            )
+        return {"total": len(data), "removed": removed}
+
+    async def read_done_target_ids(self, client: httpx.AsyncClient, tab: str) -> list[str]:
+        """Liste les target_id présents dans le dashboard (cibles déjà tentées)."""
+        real_tab = await self.ensure_tab(client, tab, DASHBOARD_HEADERS)
+        r = await self._req(
+            client, "GET",
+            f"{SHEETS_BASE}/{self.id}/values/{_range(real_tab, 'A2:C')}",
+        )
+        if r.status_code != 200:
+            raise RuntimeError(
+                f"Impossible de lire le dashboard '{real_tab}' (HTTP {r.status_code}). "
+                f"Réponse Google: {r.text[:300]}"
+            )
+        ids = []
+        seen = set()
+        for row in r.json().get("values", []):
+            tid = str(row[0]).strip() if row else ""
+            if tid and tid not in seen:
+                seen.add(tid)
+                ids.append(tid)
+        return ids
+
     async def append_results(self, client: httpx.AsyncClient, tab: str, rows: list[list]):
         """Ajoute les comptes trouvés (colonnes CSV_HEADERS + TRUE/FALSE) à l'onglet résultats."""
         real_tab = await self.ensure_tab(client, tab, CSV_HEADERS)

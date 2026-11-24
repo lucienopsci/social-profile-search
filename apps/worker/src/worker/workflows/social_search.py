@@ -235,6 +235,47 @@ class ParentParams(BaseModel):
     max_concurrent_targets: int = 5   # cibles (child workflows) en parallèle
     max_concurrent_batches: int = 3  # lots (youtube/tiktok) en parallèle
     batch_size: int = 100            # mots-clés par run de lot (youtube/tiktok)
+    cleanup_platforms: list[str] = []  # plateformes dont on purge les lignes Results/Dashboard avant tout (ex: results erronés)
+    skip_existing: bool = False      # ignorer les cibles déjà présentes dans le Dashboard
+    max_targets: int = 0             # limite du nombre de cibles traitées (0 = toutes)
+
+
+@workflows.activity(
+    start_to_close_timeout=timedelta(minutes=5),
+    retry_policy_max_attempts=2,
+)
+async def cleanup_platform_rows(sheet_name: str, platforms: list[str]) -> dict:
+    """Purge des lignes par plateforme dans Results et Dashboard (aucun appel Apify)."""
+    import httpx
+    from .sheets import SheetsClient, find_spreadsheet_id
+
+    spreadsheet_id = await find_spreadsheet_id(sheet_name)
+    sheets = SheetsClient(spreadsheet_id)
+    summary: dict = {}
+    async with httpx.AsyncClient(timeout=300) as client:
+        for p in platforms:
+            summary[f"results_{p}"] = await sheets.purge_platform_rows(
+                client, "Results", list(CSV_HEADERS), p
+            )
+            summary[f"dashboard_{p}"] = await sheets.purge_platform_rows(
+                client, "Dashboard", list(DASHBOARD_HEADERS), p
+            )
+    return summary
+
+
+@workflows.activity(
+    start_to_close_timeout=timedelta(minutes=3),
+    retry_policy_max_attempts=3,
+)
+async def fetch_done_target_ids(sheet_name: str) -> list[str]:
+    """target_id déjà présents dans le Dashboard (cibles déjà tentées)."""
+    import httpx
+    from .sheets import SheetsClient, find_spreadsheet_id
+
+    spreadsheet_id = await find_spreadsheet_id(sheet_name)
+    sheets = SheetsClient(spreadsheet_id)
+    async with httpx.AsyncClient(timeout=300) as client:
+        return await sheets.read_done_target_ids(client, "Dashboard")
 
 
 @workflows.workflow.define(
@@ -247,6 +288,11 @@ class ParentParams(BaseModel):
 class SocialProfileSearchWorkflow:
     @workflows.workflow.entrypoint
     async def run(self, params: ParentParams) -> dict:
+        cleanup_summary: dict | None = None
+        if params.cleanup_platforms:
+            cleanup_summary = await cleanup_platform_rows(
+                sheet_name=params.sheet_name, platforms=params.cleanup_platforms
+            )
         if not params.platforms:
             # Mode préparation: crée les onglets results/dashboard, aucun appel Apify.
             prepared = await prepare_sheet(sheet_name=params.sheet_name)
@@ -254,6 +300,7 @@ class SocialProfileSearchWorkflow:
                 "prepared": True,
                 "results_tab": prepared["results_tab"],
                 "dashboard_tab": prepared["dashboard_tab"],
+                "cleanup": cleanup_summary,
                 "message": "Onglets results/dashboard prêts. Aucune recherche lancée.",
             }
         invalid = [p for p in params.platforms if p not in VALID_PLATFORMS]
@@ -267,10 +314,25 @@ class SocialProfileSearchWorkflow:
             sheet_name=params.sheet_name, inputs_tab=params.inputs_tab
         )
         if not targets:
-            return {"processed": 0, "message": "Aucune cible trouvée dans l'onglet Inputs"}
+            return {"processed": 0, "cleanup": cleanup_summary,
+                    "message": "Aucune cible trouvée dans l'onglet Inputs"}
 
         # Onglets de sortie garantis présents avant le batch.
         await prepare_sheet(sheet_name=params.sheet_name)
+
+        skipped_existing = 0
+        if params.skip_existing:
+            done = set(await fetch_done_target_ids(sheet_name=params.sheet_name))
+            before = len(targets)
+            targets = [t for t in targets if t.target_id not in done]
+            skipped_existing = before - len(targets)
+        if params.max_targets and params.max_targets > 0:
+            if len(targets) > params.max_targets:
+                targets = targets[:params.max_targets]
+        if not targets:
+            return {"processed": 0, "cleanup": cleanup_summary,
+                    "skipped_existing": skipped_existing,
+                    "message": "Toutes les cibles sont déjà traitées ou aucune restante."}
 
         # ------------------------------------------------------------------
         # Plateformes batchées (youtube, tiktok): recherche par lot + attribution
@@ -342,6 +404,8 @@ class SocialProfileSearchWorkflow:
             "accounts_relevant_total": total_relevant,
             "apify_usage_usd": round(usage_end - usage_start, 4),
             "batch_stats": batch_stats,
+            "cleanup": cleanup_summary,
+            "skipped_existing": skipped_existing,
         }
 
 
