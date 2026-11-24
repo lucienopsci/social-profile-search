@@ -3,7 +3,9 @@
 Utilise l'API REST Google Sheets avec un compte de service (GOOGLE_SERVICE_ACCOUNT_JSON)
 - fichier de clé JSON stocké dans le secret du même nom.
 Les onglets results/dashboard manquants sont créés automatiquement (avec en-têtes).
+Toutes les requêtes retentent avec backoff sur 429 (quota écritures ~60/min par user).
 """
+import asyncio
 import json
 import os
 import re
@@ -71,13 +73,31 @@ class SheetsClient:
         return {"Authorization": f"Bearer {self._token}"}
 
     async def _req(self, client: httpx.AsyncClient, method: str, url: str, **kw):
-        headers = await self._headers(client)
-        r = await client.request(method, url, headers=headers, **kw)
-        if r.status_code == 401:  # token expiré: retry une fois
-            self._token = None
+        """Requête Sheets avec retry/backoff sur 429 (quota) et 503.
+
+        Respecte le header Retry-After de Google; sinon backoff exponentiel
+        10s, 20s, 40s, 60s, 60s (capé), jusqu'à 6 tentatives.
+        """
+        last_r = None
+        r = None
+        for attempt in range(6):
             headers = await self._headers(client)
             r = await client.request(method, url, headers=headers, **kw)
-        return r
+            if r.status_code == 401:  # token expiré: refresh une fois
+                self._token = None
+                headers = await self._headers(client)
+                r = await client.request(method, url, headers=headers, **kw)
+            if r.status_code in (429, 503) and attempt < 5:
+                retry_after = r.headers.get("Retry-After")
+                try:
+                    wait = float(retry_after) if retry_after else min(10 * (2 ** attempt), 60)
+                except ValueError:
+                    wait = min(10 * (2 ** attempt), 60)
+                last_r = r
+                await asyncio.sleep(wait)
+                continue
+            return r
+        return last_r if last_r is not None else r
 
     @staticmethod
     def _norm(s: str) -> str:
@@ -87,17 +107,20 @@ class SheetsClient:
         r = await self._req(
             client, "GET", f"{SHEETS_BASE}/{self.id}", params={"fields": "sheets.properties.title"}
         )
-        if r.status_code == 200:
-            data = r.json().get("sheets", [])
-            return [s.get("properties", {}).get("title", "?") for s in data]
-        return []
+        if r.status_code != 200:
+            # NE JAMAIS déduire "onglet absent" d'une erreur réseau/quota
+            raise RuntimeError(
+                f"Impossible de lister les onglets du spreadsheet (HTTP {r.status_code}). "
+                f"Réponse Google: {r.text[:300]}"
+            )
+        data = r.json().get("sheets", [])
+        return [s.get("properties", {}).get("title", "?") for s in data]
 
     async def _resolve_tab(self, client: httpx.AsyncClient, tab: str) -> str:
         """Titre réel de l'onglet, insensible casse/espaces, tolérant aux préfixes."""
         if self._tab_map is None:
-            self._tab_map = {}
-            for t in await self._list_tabs(client):
-                self._tab_map[self._norm(t)] = t
+            titles = await self._list_tabs(client)
+            self._tab_map = {self._norm(t): t for t in titles}
         key = self._norm(tab)
         if key in self._tab_map:
             return self._tab_map[key]
@@ -115,6 +138,11 @@ class SheetsClient:
             json={"requests": [{"addSheet": {"properties": {"title": tab}}}]},
         )
         if r.status_code >= 400:
+            # déjà créé entre-temps par un autre child: ignorer cette erreur précise
+            if r.status_code == 400 and "already exists" in r.text:
+                if self._tab_map is not None:
+                    self._tab_map[self._norm(tab)] = tab
+                return tab
             raise RuntimeError(
                 f"Impossible de créer l'onglet '{tab}' (HTTP {r.status_code}). "
                 f"Réponse Google: {r.text[:300]}"
@@ -138,12 +166,15 @@ class SheetsClient:
         """Retourne le titre réel de l'onglet, en le créant avec en-têtes s'il est absent."""
         try:
             return await self._resolve_tab(client, tab)
-        except RuntimeError:
-            return await self._create_tab(client, tab, headers)
+        except RuntimeError as e:
+            # ne créer que si l'erreur vient de l'absence réelle d'onglet
+            if "introuvable" in str(e):
+                return await self._create_tab(client, tab, headers)
+            raise
 
     async def read_inputs(self, tab: str) -> list[list]:
         """Lit l'onglet inputs: colonnes target_id, name, description."""
-        async with httpx.AsyncClient(timeout=60) as client:
+        async with httpx.AsyncClient(timeout=120) as client:
             real_tab = await self.ensure_tab(client, tab, ["target_id", "name", "description"])
             r = await self._req(
                 client, "GET",

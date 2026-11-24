@@ -26,7 +26,7 @@ from .models import (
 # --------------------------------------------------------------------------
 
 @workflows.activity(
-    start_to_close_timeout=timedelta(minutes=2),
+    start_to_close_timeout=timedelta(minutes=3),
     retry_policy_max_attempts=3,
 )
 async def fetch_targets(sheet_name: str, inputs_tab: str) -> list[TargetInput]:
@@ -49,7 +49,7 @@ async def fetch_targets(sheet_name: str, inputs_tab: str) -> list[TargetInput]:
 
 
 @workflows.activity(
-    start_to_close_timeout=timedelta(minutes=2),
+    start_to_close_timeout=timedelta(minutes=5),
     retry_policy_max_attempts=3,
 )
 async def prepare_sheet(sheet_name: str) -> dict:
@@ -59,7 +59,7 @@ async def prepare_sheet(sheet_name: str) -> dict:
 
     spreadsheet_id = await find_spreadsheet_id(sheet_name)
     sheets = SheetsClient(spreadsheet_id)
-    async with httpx.AsyncClient(timeout=60) as client:
+    async with httpx.AsyncClient(timeout=300) as client:
         results_tab = await sheets.ensure_tab(client, "Results", list(CSV_HEADERS))
         dashboard_tab = await sheets.ensure_tab(client, "Dashboard", list(DASHBOARD_HEADERS))
     return {"results_tab": results_tab, "dashboard_tab": dashboard_tab}
@@ -77,7 +77,7 @@ async def fetch_usage_usd() -> float:
 
 
 @workflows.activity(
-    start_to_close_timeout=timedelta(minutes=1),
+    start_to_close_timeout=timedelta(minutes=4),
     retry_policy_max_attempts=3,
 )
 async def search_platform(platform: str, query: str) -> dict:
@@ -102,8 +102,8 @@ async def match_accounts(rows: list[dict], target: TargetInput) -> list[dict]:
 
 
 @workflows.activity(
-    start_to_close_timeout=timedelta(minutes=2),
-    retry_policy_max_attempts=3,
+    start_to_close_timeout=timedelta(minutes=5),
+    retry_policy_max_attempts=4,
 )
 async def append_results_rows(sheet_name: str, results_tab: str, rows: list[list]) -> None:
     """Écrit les résultats dans l'onglet résultats du Sheet."""
@@ -112,13 +112,13 @@ async def append_results_rows(sheet_name: str, results_tab: str, rows: list[list
 
     spreadsheet_id = await find_spreadsheet_id(sheet_name)
     sheets = SheetsClient(spreadsheet_id)
-    async with httpx.AsyncClient(timeout=60) as client:
+    async with httpx.AsyncClient(timeout=300) as client:
         await sheets.append_results(client, results_tab, rows)
 
 
 @workflows.activity(
-    start_to_close_timeout=timedelta(minutes=2),
-    retry_policy_max_attempts=3,
+    start_to_close_timeout=timedelta(minutes=5),
+    retry_policy_max_attempts=4,
 )
 async def upsert_status(sheet_name: str, dashboard_tab: str, row: list) -> None:
     """Écrit une ligne d'état dans le dashboard du Sheet."""
@@ -127,7 +127,7 @@ async def upsert_status(sheet_name: str, dashboard_tab: str, row: list) -> None:
 
     spreadsheet_id = await find_spreadsheet_id(sheet_name)
     sheets = SheetsClient(spreadsheet_id)
-    async with httpx.AsyncClient(timeout=60) as client:
+    async with httpx.AsyncClient(timeout=300) as client:
         await sheets.upsert_dashboard(client, dashboard_tab, row)
 
 
@@ -266,7 +266,7 @@ class SocialProfileSearchWorkflow:
 
 
 @workflows.activity(
-    start_to_close_timeout=timedelta(hours=1),
+    start_to_close_timeout=timedelta(hours=2),
     retry_policy_max_attempts=2,
 )
 async def run_target_child(params: ProcessTargetParams) -> dict:
