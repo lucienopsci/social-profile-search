@@ -1,33 +1,46 @@
-"""Clients Apify: recherches de profils sociaux uniquement, 1 page / 10 résultats max.
+"""Clients Apify: recherches de profils sociaux uniquement, 10 résultats max.
 
 Règles issues de la skill apify-api-usage:
 - acteurs autorisés uniquement, aucun autre acteur
-- searchTerms / maxItems / maxPages / searchType configurés pour des profils et 10 résultats max
 - aucune donnée fabriquée: uniquement ce qu'Apify retourne
 
-YouTube: recherche par lot via apidojo~youtube-channel-information-scraper
-(keywords array, ~0.001$/recherche + ~0.0005$/chaîne) avec attribution de chaque
-résultat à son mot-clé d'origine; repli individuel du même acteur côté enfant.
+Recherches PAR LOT (attribution de chaque résultat à son mot-clé d'origine):
+- youtube: apidojo~youtube-channel-information-scraper (keywords array)
+  ~0.001$/recherche + ~0.0005$/chaîne, pas de frais de lancement
+- tiktok: clockworks~tiktok-scraper (searchQueries + searchSection "/user")
+  ~0.003$/profil + 0.001$/run, batch de recherche de comptes natif
+Repli individuel du même acteur côté enfant si attribution/lot en échec.
 """
 import os
 import unicodedata
 
 import httpx
 
-from .models import VALID_PLATFORMS
+from .models import BATCHED_PLATFORMS, VALID_PLATFORMS
 
 APIFY_BASE = "https://api.apify.com/v2"
 
-# Recherche YouTube par mot-clé (discovery) - bien moins cher que powerai:
-# pas de frais de lancement, ~0.00099$/recherche + ~0.000495$/chaîne retournée.
-YOUTUBE_SEARCH_ACTOR = "apidojo~youtube-channel-information-scraper"
+# Recherches par lot: 1 run pour N mots-clés, attribution par search_query.
+BATCH_SEARCH_ACTORS = {
+    "youtube": {
+        "actor_id": "apidojo~youtube-channel-information-scraper",
+        # ~0.00099$/recherche + ~0.000495$/chaîne retournée, pas de frais de lancement
+        "input": lambda kws: {"keywords": kws, "maxItems": len(kws) * 10},
+    },
+    "tiktok": {
+        "actor_id": "clockworks~tiktok-scraper",
+        # ~0.003$/profil + 0.001$/run (Bronze); "/user" = recherche de comptes
+        "input": lambda kws: {"searchQueries": kws, "searchSection": "/user", "maxProfilesPerQuery": 10},
+    },
+}
 
+# Recherche individuelle (1 cible): repli des plateformes par lot + autres plateformes.
 ACTORS = {
     "linkedin": {
         "actor_id": "harvestapi~linkedin-profile-search-by-name",
         "input": lambda q: {
             "searchTerm": q,
-            "profileScraperMode": "Short",  # requis par le schéma de l'acteur
+            "profileScraperMode": "Short",
             "maxItems": 10,
             "maxPages": 1,
         },
@@ -49,16 +62,17 @@ ACTORS = {
         "input": lambda q: {"search": q, "searchType": "user", "searchLimit": 10},
     },
     "tiktok": {
-        "actor_id": "igview-owner~tiktok-search-user-scraper",
-        "input": lambda q: {"searchQuery": q, "maxResults": 10, "maxPages": 1},
+        # repli individuel du même acteur que le lot
+        "actor_id": BATCH_SEARCH_ACTORS["tiktok"]["actor_id"],
+        "input": lambda q: {"searchQueries": [q], "searchSection": "/user", "maxProfilesPerQuery": 10},
     },
     "facebook": {
         "actor_id": "patient_discovery~facebook-search-people",
         "input": lambda q: {"searchQuery": q, "maxPages": 1},
     },
-    # repli individuel (si le lot youtube échoue): même acteur, un seul mot-clé
     "youtube": {
-        "actor_id": YOUTUBE_SEARCH_ACTOR,
+        # repli individuel du même acteur que le lot
+        "actor_id": BATCH_SEARCH_ACTORS["youtube"]["actor_id"],
         "input": lambda q: {"keywords": [q], "maxItems": 10},
     },
 }
@@ -104,11 +118,13 @@ def _row_from_search(platform: str, query: str, p: dict) -> dict:
         "search_query": query,
         "platform": platform,
         "account_id": _str(p, "id", "userId", "uid", "did", "channelId"),
-        "account_username": _str(p, "username", "handle", "user", "userName"),
-        "account_name": _str(p, "fullName", "fullNameDecoded", "displayName", "name", "title", "channelTitle"),
-        "account_description": _str(p, "bio", "description", "about", "headline", "summary"),
-        "followers": p.get("followersCount") or p.get("followerCount") or p.get("subscriberCount") or p.get("subscribers") or "",
-        "url": _str(p, "url", "profileUrl", "profile_url", "channelUrl"),
+        "account_username": _str(p, "username", "uniqueId", "handle", "user", "userName"),
+        "account_name": _str(p, "nickName", "fullName", "fullNameDecoded", "displayName", "name", "title", "channelTitle"),
+        "account_description": _str(p, "signature", "bio", "description", "about", "headline", "summary"),
+        "followers": p.get("followersCount") or p.get("followerCount") or p.get("followerCount") or p.get("subscriberCount") or p.get("subscribers") or "",
+        "url": _str(p, "url", "webUrl", "profileUrl", "profile_url", "channelUrl") or (
+            "https://www.tiktok.com/@" + _str(p, "uniqueId", "username") if platform == "tiktok" and (_str(p, "uniqueId", "username")) else ""
+        ),
         "relevant": "",
     }
 
@@ -143,61 +159,58 @@ async def search_profiles(platform: str, query: str) -> dict:
 
 
 # --------------------------------------------------------------------------
-# YouTube par lot (apidojo): 1 run pour N mots-clés, attribution par résultat
+# Recherches par lot (youtube/tiktok): 1 run pour N mots-clés
 # --------------------------------------------------------------------------
 
 def _attributed_keyword(p: dict, keywords_norm: dict[str, str]) -> str | None:
-    """Retrouve le mot-clé d'origine d'un résultat youtube (clé normalisée)."""
-    for k in ("searchKeyword", "keyword", "searchQuery", "query", "searchTerm"):
+    """Retrouve le mot-clé d'origine d'un résultat (clé normalisée)."""
+    for k in ("searchKeyword", "keyword", "searchQuery", "query", "searchTerm", "inputQuery"):
         v = _norm_name(str(p.get(k) or ""))
         if v and v in keywords_norm:
             return keywords_norm[v]
     return None
 
 
-async def search_channels_batch(keywords: list[str]) -> dict:
-    """Recherche par lot de chaînes youtube (acteur apidojo).
+async def search_profiles_batch(platform: str, keywords: list[str]) -> dict:
+    """Recherche par lot pour une plateforme batchée (youtube/tiktok).
 
-    - 1 run pour len(keywords) recherches, maxItems = 10 par mot-clé
+    - 1 run pour len(keywords) recherches, ~10 résultats par mot-clé
     - chaque résultat est attribué à son mot-clé d'origine (search_query)
-    - les résultats non attribuables sont rejetés et comptés (l'appelant
-      décide du repli individuel pour les cibles concernées)
+    - résultats non attribuables rejetés et comptés; l'appelant décide du repli
     """
+    if platform not in BATCHED_PLATFORMS:
+        raise ValueError(f"Plateforme non batchée: {platform}. Batchées: {sorted(BATCHED_PLATFORMS)}")
     if not keywords:
         return {"rows": [], "unattributed": 0, "missing_keywords": []}
     norm_map = {_norm_name(k): k for k in keywords}
-    run_input = {"keywords": keywords, "maxItems": len(keywords) * 10}
+    spec = BATCH_SEARCH_ACTORS[platform]
+    run_input = spec["input"](keywords)
 
     async with httpx.AsyncClient(timeout=600) as client:
         r = await client.post(
-            f"{APIFY_BASE}/acts/{YOUTUBE_SEARCH_ACTOR}/run-sync-get-dataset-items",
+            f"{APIFY_BASE}/acts/{spec['actor_id']}/run-sync-get-dataset-items",
             params={"memory": 1024, "timeout": 300},
             headers=_auth_headers(),
             json=run_input,
         )
         if r.status_code >= 400:
-            _raise_detail(r, "youtube")
+            _raise_detail(r, platform)
         items = r.json() or []
 
     rows = []
     unattributed = 0
-    seen_keywords = set()
+    seen = set()
     for it in items:
         p = _props(it)
         kw = _attributed_keyword(p, norm_map)
         if kw is None:
             unattributed += 1
             continue
-        seen_keywords.add(_norm_name(kw))
-        rows.append(_row_from_search("youtube", kw, p))
+        seen.add(_norm_name(kw))
+        rows.append(_row_from_search(platform, kw, p))
 
-    missing = [k for k in keywords if _norm_name(k) not in seen_keywords]
-    return {
-        "rows": rows,
-        "unattributed": unattributed,
-        # mots-clés du lot sans aucun résultat attribué (cibles à repasser en individuel)
-        "missing_keywords": missing,
-    }
+    missing = [k for k in keywords if _norm_name(k) not in seen]
+    return {"rows": rows, "unattributed": unattributed, "missing_keywords": missing}
 
 
 async def get_usage_usd() -> float:
