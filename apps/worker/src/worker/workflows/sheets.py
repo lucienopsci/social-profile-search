@@ -292,7 +292,7 @@ class SheetsClient:
             tid = str(row[0]).strip() if len(row) > 0 else ""
             nm = str(row[1]).strip() if len(row) > 1 else ""
             if tid and nm:
-                name_map[_norm(nm)] = (tid, nm)
+                name_map[self._norm(nm)] = (tid, nm)
 
         # 2) Results: lecture + déduplication
         real_results = await self.ensure_tab(client, "Results", CSV_HEADERS)
@@ -333,7 +333,7 @@ class SheetsClient:
         for row in kept:
             nm, plat = row[0].strip(), row[1].strip().lower()
             rel = row[8].strip().upper() == "TRUE" if len(row) > 8 else False
-            mapped = name_map.get(_norm(nm))
+            mapped = name_map.get(self._norm(nm))
             if mapped is None:
                 continue
             tid = mapped[0]
