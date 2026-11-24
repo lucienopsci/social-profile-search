@@ -11,7 +11,14 @@ from datetime import datetime, timedelta
 import mistralai.workflows as workflows
 from pydantic import BaseModel, ConfigDict
 
-from .models import CSV_HEADERS, VALID_PLATFORMS, ProcessTargetParams, TargetInput, PerPlatformStatus
+from .models import (
+    CSV_HEADERS,
+    DASHBOARD_HEADERS,
+    VALID_PLATFORMS,
+    ProcessTargetParams,
+    TargetInput,
+    PerPlatformStatus,
+)
 
 
 # --------------------------------------------------------------------------
