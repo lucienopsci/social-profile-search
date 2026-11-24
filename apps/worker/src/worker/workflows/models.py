@@ -11,15 +11,12 @@ class TargetInput(BaseModel):
     description: str = ""   # description (peut être vide)
 
 
-class BatchParams(BaseModel):
-    """Entrée du workflow parent social-profile-search."""
+class BatchSearchParams(BaseModel):
+    """Lot de mots-clés pour une recherche par lot (youtube/tiktok)."""
     model_config = ConfigDict(extra="forbid")
 
-    sheet_name: str                 # nom du Google Sheet de sortie + dashboard
-    inputs_tab: str = "Inputs"      # onglet où lire les cibles
-    platforms: list[str]            # subset de: linkedin, x, bluesky, instagram, tiktok, facebook, youtube
-    max_concurrency: int = 20        # cibles traitées en parallèle
-    platforms_concurrency: int = 6  # plateformes appelées en parallèle par cible
+    platform: str
+    keywords: list[str]
 
 
 class TargetStatus(BaseModel):
@@ -27,11 +24,11 @@ class TargetStatus(BaseModel):
     target_id: str
     name: str
     platform_name: str = ""
-    searched: bool = False          # recherche effectuée sur la plateforme
-    accounts_returned: int = 0      # comptes retournés par Apify
-    accounts_checked: int = 0        # comptes vérifiés (règle exact/fuzzy/approx)
-    accounts_relevant: int = 0      # comptes jugés pertinents (relevant=TRUE)
-    cost_usd: float = 0.0           # coût Apify engagé pour cette cible
+    searched: bool = False
+    accounts_returned: int = 0
+    accounts_checked: int = 0
+    accounts_relevant: int = 0
+    cost_usd: float = 0.0
     error: str = ""
 
 
@@ -53,14 +50,16 @@ class ProcessTargetParams(BaseModel):
     target: TargetInput
     sheet_name: str
     platforms: list[str]
-    # lignes youtube déjà cherchées en lot par le parent (attribution par search_query).
-    # None = le child fait lui-même la recherche youtube individuelle (repli).
-    youtube_rows: "list[dict] | None" = None
+    # résultats pré-cherchés en lot par le parent, clé = plateforme ("youtube", "tiktok"),
+    # valeur = lignes attribuées à cette cible (search_query == target.name).
+    # None = le child fait lui-même la recherche individuelle (repli).
+    precomputed_rows: "dict[str, list[dict]] | None" = None
 
 
 # Constantes pures (définies ici car le sandbox de workflow interdit d'importer
 # les modules d'E/S, y compris les constantes qui y vivent).
 VALID_PLATFORMS = frozenset({"linkedin", "x", "bluesky", "instagram", "tiktok", "facebook", "youtube"})
+BATCHED_PLATFORMS = frozenset({"youtube", "tiktok"})
 
 CSV_HEADERS = [
     "search_query", "platform", "account_id", "account_username",
