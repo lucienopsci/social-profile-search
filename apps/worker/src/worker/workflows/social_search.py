@@ -232,6 +232,23 @@ class ParentParams(BaseModel):
     cleanup_platforms: list[str] = []  # plateformes dont on purge les lignes Results/Dashboard avant tout (ex: results erronés)
     skip_existing: bool = False      # ignorer les cibles déjà présentes dans le Dashboard
     max_targets: int = 0             # limite du nombre de cibles traitées (0 = toutes)
+    finalize_only: bool = False      # mode finalisation SANS Apify: dédoublonne Results et
+                                     # reconstruit les lignes Dashboard depuis les Results
+
+
+@workflows.activity(
+    start_to_close_timeout=timedelta(minutes=10),
+    retry_policy_max_attempts=2,
+)
+async def finalize_sheet(sheet_name: str, inputs_tab: str) -> dict:
+    """Dédoublonne Results et reconstruit le Dashboard depuis les Results (aucun Apify)."""
+    import httpx
+    from .sheets import SheetsClient, find_spreadsheet_id
+
+    spreadsheet_id = await find_spreadsheet_id(sheet_name)
+    sheets = SheetsClient(spreadsheet_id)
+    async with httpx.AsyncClient(timeout=300) as client:
+        return await sheets.finalize(client, inputs_tab)
 
 
 @workflows.activity(
@@ -283,6 +300,13 @@ async def fetch_done_pairs(sheet_name: str) -> list[list]:
 class SocialProfileSearchWorkflow:
     @workflows.workflow.entrypoint
     async def run(self, params: ParentParams) -> dict:
+        if params.finalize_only:
+            # Mode finalisation: aucun appel Apify
+            finalized = await finalize_sheet(
+                sheet_name=params.sheet_name, inputs_tab=params.inputs_tab
+            )
+            return {"finalize": finalized,
+                    "message": "Results dédoublonné et Dashboard reconstruit depuis les résultats existants."}
         cleanup_summary: dict | None = None
         if params.cleanup_platforms:
             cleanup_summary = await cleanup_platform_rows(

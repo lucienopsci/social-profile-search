@@ -269,6 +269,90 @@ class SheetsClient:
                 pairs.append((tid, plat))
         return pairs
 
+    async def finalize(self, client: httpx.AsyncClient, inputs_tab: str) -> dict:
+        """Mode finalisation SANS Apify:
+
+        1. lit l'onglet inputs (nom -> target_id)
+        2. lit et déduplique l'onglet Results (lignes exactement identiques),
+           le réécrit sans doublons
+        3. recalcule les stats par (target_id, platform) depuis les lignes Results
+           et upsert le Dashboard (via bulk_write, clé (target_id, platform))
+        """
+        import datetime as _dt
+
+        # 1) mapping nom de cible -> (target_id, name)
+        real_in = await self.ensure_tab(client, inputs_tab, ["target_id", "name", "description"])
+        r = await self._req(
+            client, "GET", f"{SHEETS_BASE}/{self.id}/values/{_range(real_in, 'A2:C')}"
+        )
+        if r.status_code != 200:
+            raise RuntimeError(f"Impossible de lire '{real_in}' (HTTP {r.status_code}): {r.text[:200]}")
+        name_map: dict[str, tuple[str, str]] = {}
+        for row in r.json().get("values", []):
+            tid = str(row[0]).strip() if len(row) > 0 else ""
+            nm = str(row[1]).strip() if len(row) > 1 else ""
+            if tid and nm:
+                name_map[_norm(nm)] = (tid, nm)
+
+        # 2) Results: lecture + déduplication
+        real_results = await self.ensure_tab(client, "Results", CSV_HEADERS)
+        r = await self._req(
+            client, "GET", f"{SHEETS_BASE}/{self.id}/values/{_range(real_results, 'A1:Z')}"
+        )
+        if r.status_code != 200:
+            raise RuntimeError(f"Impossible de lire '{real_results}': {r.text[:200]}")
+        values = r.json().get("values", [])
+        width = len(CSV_HEADERS)
+        seen, kept, duplicates = set(), [], 0
+        for row in values[1:]:
+            row = [("" if v is None else str(v)) for v in row]
+            row = (row + [""] * width)[:width]
+            key = tuple(row)
+            if key in seen:
+                duplicates += 1
+                continue
+            seen.add(key)
+            kept.append(row)
+
+        if duplicates:
+            r = await self._req(client, "POST",
+                                 f"{SHEETS_BASE}/{self.id}/values/{_range(real_results, 'A:Z')}:clear")
+            if r.status_code != 200:
+                raise RuntimeError(f"Impossible de vider '{real_results}': {r.text[:200]}")
+            r = await self._req(client, "PUT",
+                               f"{SHEETS_BASE}/{self.id}/values/{_range(real_results, 'A1')}",
+                               params={"valueInputOption": "USER_ENTERED"},
+                               json={"values": [list(CSV_HEADERS)] + kept})
+            if r.status_code != 200:
+                raise RuntimeError(f"Impossible de réécrire '{real_results}': {r.text[:200]}")
+
+        # 3) stats par (target_id, platform)
+        now = _dt.datetime.utcnow().isoformat(timespec="seconds") + "Z"
+        stats: dict[tuple[str, str], list] = {}
+        targets_by_key: dict[tuple[str, str], str] = {}
+        for row in kept:
+            nm, plat = row[0].strip(), row[1].strip().lower()
+            rel = row[8].strip().upper() == "TRUE" if len(row) > 8 else False
+            mapped = name_map.get(_norm(nm))
+            if mapped is None:
+                continue
+            tid = mapped[0]
+            targets_by_key[(tid, plat)] = mapped[1]
+            st = stats.setdefault((tid, plat), [tid, nm, plat, "TRUE", 0, 0, 0, 0.0, "finalize", now])
+            st[4] += 1   # accounts_returned
+            st[5] += 1   # accounts_checked
+            if rel:
+                st[6] += 1
+
+        status_rows = list(stats.values())
+        n_results, n_status = await self.bulk_write(client, [], status_rows)
+        return {
+            "results_rows_before": len(values) - 1,
+            "results_rows_after": len(kept),
+            "duplicates_removed": duplicates,
+            "dashboard_rows_upserted": len(status_rows),
+        }
+
     async def bulk_write(self, client: httpx.AsyncClient, csv_rows: list[list], status_rows: list[list]) -> tuple[int, int]:
         """Écrit groupée: append Results (lots de 1000 lignes) + upsert Dashboard
         (mise à jour en place via values:batchUpdate + append des nouvelles lignes).
@@ -339,7 +423,8 @@ class SheetsClient:
                         "valueInputOption": "USER_ENTERED",
                         "data": [
                             {
-                                "range": _range(real_dash, f"A{rownum}:J{rownum}"),
+                                # IMPORTANT: plage NON encodée (corps JSON, pas une URL)
+                                "range": f"'{real_dash.replace(chr(39), chr(39)*2)}'!A{rownum}:J{rownum}",
                                 "values": [vals],
                             }
                             for rownum, vals in chunk
