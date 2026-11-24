@@ -243,26 +243,31 @@ class SheetsClient:
             )
         return {"total": len(data), "removed": removed}
 
-    async def read_done_target_ids(self, client: httpx.AsyncClient, tab: str) -> list[str]:
-        """Liste les target_id présents dans le dashboard (cibles déjà tentées)."""
+    async def read_done_pairs(self, client: httpx.AsyncClient, tab: str) -> list[tuple[str, str]]:
+        """Paires (target_id, platform) du dashboard AVEC succès (searched=TRUE).
+
+        Permet de ne relancer que les plateformes manquantes ou en échec d'une cible.
+        """
         real_tab = await self.ensure_tab(client, tab, DASHBOARD_HEADERS)
         r = await self._req(
             client, "GET",
-            f"{SHEETS_BASE}/{self.id}/values/{_range(real_tab, 'A2:C')}",
+            f"{SHEETS_BASE}/{self.id}/values/{_range(real_tab, 'A2:D')}",
         )
         if r.status_code != 200:
             raise RuntimeError(
                 f"Impossible de lire le dashboard '{real_tab}' (HTTP {r.status_code}). "
                 f"Réponse Google: {r.text[:300]}"
             )
-        ids = []
+        pairs = []
         seen = set()
         for row in r.json().get("values", []):
-            tid = str(row[0]).strip() if row else ""
-            if tid and tid not in seen:
-                seen.add(tid)
-                ids.append(tid)
-        return ids
+            tid = str(row[0]).strip() if len(row) > 0 else ""
+            plat = str(row[2]).strip() if len(row) > 2 else ""
+            searched = str(row[3]).strip().upper() if len(row) > 3 else ""
+            if tid and plat and searched in ("TRUE", "1", "T") and (tid, plat) not in seen:
+                seen.add((tid, plat))
+                pairs.append((tid, plat))
+        return pairs
 
     async def bulk_write(self, client: httpx.AsyncClient, csv_rows: list[list], status_rows: list[list]) -> tuple[int, int]:
         """Écrit groupée: append Results (lots de 1000 lignes) + upsert Dashboard

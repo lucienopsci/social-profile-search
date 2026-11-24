@@ -261,15 +261,16 @@ async def cleanup_platform_rows(sheet_name: str, platforms: list[str]) -> dict:
     start_to_close_timeout=timedelta(minutes=3),
     retry_policy_max_attempts=3,
 )
-async def fetch_done_target_ids(sheet_name: str) -> list[str]:
-    """target_id déjà présents dans le Dashboard (cibles déjà tentées)."""
+async def fetch_done_pairs(sheet_name: str) -> list[list]:
+    """Paires [target_id, platform] en succès dans le Dashboard (searched=TRUE)."""
     import httpx
     from .sheets import SheetsClient, find_spreadsheet_id
 
     spreadsheet_id = await find_spreadsheet_id(sheet_name)
     sheets = SheetsClient(spreadsheet_id)
     async with httpx.AsyncClient(timeout=300) as client:
-        return await sheets.read_done_target_ids(client, "Dashboard")
+        pairs = await sheets.read_done_pairs(client, "Dashboard")
+    return [[tid, plat] for tid, plat in pairs]
 
 
 @workflows.workflow.define(
@@ -315,11 +316,19 @@ class SocialProfileSearchWorkflow:
         await prepare_sheet(sheet_name=params.sheet_name)
 
         skipped_existing = 0
+        missing_platforms: dict = {}
         if params.skip_existing:
-            done = set(await fetch_done_target_ids(sheet_name=params.sheet_name))
+            done_pairs = {tuple(x) for x in await fetch_done_pairs(sheet_name=params.sheet_name)}
+            # une cible est "faite" pour une plateforme ssi ligne dashboard en succès
+            missing_platforms = {
+                t.target_id: [p for p in params.platforms if (t.target_id, p) not in done_pairs]
+                for t in targets
+            }
             before = len(targets)
-            targets = [t for t in targets if t.target_id not in done]
+            targets = [t for t in targets if missing_platforms[t.target_id]]
             skipped_existing = before - len(targets)
+        else:
+            missing_platforms = {t.target_id: list(params.platforms) for t in targets}
         if params.max_targets and params.max_targets > 0:
             if len(targets) > params.max_targets:
                 targets = targets[:params.max_targets]
@@ -333,24 +342,28 @@ class SocialProfileSearchWorkflow:
         # ------------------------------------------------------------------
         batched = [p for p in params.platforms if p in BATCHED_PLATFORMS]
         size = max(1, params.batch_size)
-        batches = [targets[i:i + size] for i in range(0, len(targets), size)]
+        # lots par plateforme batchée, sur les seules cibles qui manquent cette plateforme
+        batches: dict[str, list[list[TargetInput]]] = {}
 
         # rows par plateforme, puis par nom de cible (search_query)
         precomputed: dict[str, dict[str, list[dict]]] = {p: {} for p in batched}
         batch_stats: dict[str, dict] = {}
         for platform in batched:
+            needing = [t for t in targets if platform in missing_platforms[t.target_id]]
+            plat_batches = [needing[i:i + size] for i in range(0, len(needing), size)]
+            batches[platform] = plat_batches
             items = [
                 BatchSearchParams(platform=platform, keywords=[t.name for t in b])
-                for b in batches
+                for b in plat_batches
             ]
             results = await workflows.execute_activities_in_parallel(
                 activity=search_platform_batch,
                 items=items,
                 max_concurrent_scheduled_tasks=max(1, params.max_concurrent_batches),
             )
-            stats = {"batches": len(batches), "batch_failed": 0,
+            stats = {"batches": len(plat_batches), "batch_failed": 0,
                      "unattributed": 0, "fallback_targets": 0}
-            for b, res in zip(batches, results):
+            for b, res in zip(plat_batches, results):
                 if res is None or res.get("failed"):
                     # lot échoué: ses cibles seront comptées en repli par la boucle finale
                     stats["batch_failed"] += 1
@@ -359,7 +372,7 @@ class SocialProfileSearchWorkflow:
                 for row in res.get("rows", []):
                     precomputed[platform].setdefault(row["search_query"], []).append(row)
             # cibles sans aucune ligne attribuée (lot échoué inclus) -> repli individuel
-            for t in targets:
+            for t in needing:
                 if t.name not in precomputed[platform]:
                     stats["fallback_targets"] += 1
             batch_stats[platform] = stats
@@ -374,11 +387,12 @@ class SocialProfileSearchWorkflow:
             ProcessTargetParams(
                 target=t,
                 sheet_name=params.sheet_name,
-                platforms=params.platforms,
+                # uniquement les plateformes manquantes/échouées de cette cible
+                platforms=missing_platforms[t.target_id],
                 precomputed_rows={
                     p: precomputed[p][t.name]
                     for p in batched
-                    if t.name in precomputed[p]
+                    if p in missing_platforms[t.target_id] and t.name in precomputed[p]
                 } or None,
             )
             for t in targets

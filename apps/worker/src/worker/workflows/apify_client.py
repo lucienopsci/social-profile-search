@@ -114,6 +114,25 @@ def _raise_detail(r: httpx.Response, platform: str) -> None:
 
 def _row_from_search(platform: str, query: str, p: dict) -> dict:
     """Ligne CSV normalisée depuis les propriétés brutes d'un item Apify."""
+    # TikTok clockworks: les items de recherche sont des VIDÉOS; le profil
+    # de l'auteur est dans authorMeta (id, name=handle, nickName, signature, fans,
+    # profileUrl). Le mot-clé d'origine est dans searchQuery (attribution).
+    if platform == "tiktok" and isinstance(p.get("authorMeta"), dict):
+        am = p["authorMeta"]
+        handle = _str(am, "name", "uniqueId", "username")
+        return {
+            "search_query": query,
+            "platform": platform,
+            "account_id": _str(am, "id", "userId", "uid"),
+            "account_username": handle,
+            "account_name": _str(am, "nickName", "fullName"),
+            "account_description": _str(am, "signature", "bio"),
+            "followers": am.get("fans") or am.get("followerCount") or "",
+            "url": _str(am, "profileUrl", "url") or (
+                "https://www.tiktok.com/@" + handle if platform == "tiktok" and handle else ""
+            ),
+            "relevant": "",
+        }
     return {
         "search_query": query,
         "platform": platform,
@@ -200,6 +219,7 @@ async def search_profiles_batch(platform: str, keywords: list[str]) -> dict:
     rows = []
     unattributed = 0
     seen = set()
+    seen_accounts = set()
     for it in items:
         p = _props(it)
         kw = _attributed_keyword(p, norm_map)
@@ -207,7 +227,13 @@ async def search_profiles_batch(platform: str, keywords: list[str]) -> dict:
             unattributed += 1
             continue
         seen.add(_norm_name(kw))
-        rows.append(_row_from_search(platform, kw, p))
+        row = _row_from_search(platform, kw, p)
+        # déduplication par compte (clockworks renvoie plusieurs vidéos du même auteur)
+        dedup_key = (platform, row.get("account_id") or row.get("account_username"))
+        if dedup_key in seen_accounts:
+            continue
+        seen_accounts.add(dedup_key)
+        rows.append(row)
 
     missing = [k for k in keywords if _norm_name(k) not in seen]
     return {"rows": rows, "unattributed": unattributed, "missing_keywords": missing}
