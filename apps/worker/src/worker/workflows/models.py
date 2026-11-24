@@ -53,6 +53,9 @@ class ProcessTargetParams(BaseModel):
     target: TargetInput
     sheet_name: str
     platforms: list[str]
+    # lignes youtube déjà cherchées en lot par le parent (attribution par search_query).
+    # None = le child fait lui-même la recherche youtube individuelle (repli).
+    youtube_rows: "list[dict] | None" = None
 
 
 # Constantes pures (définies ici car le sandbox de workflow interdit d'importer
