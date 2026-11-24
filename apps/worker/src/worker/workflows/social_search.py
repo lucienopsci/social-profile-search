@@ -208,26 +208,10 @@ class ProcessTargetWorkflow:
                     platform=platform, searched=False, error=str(e)[:200],
                 ))
 
-        if all_rows:
-            await append_results_rows(
-                sheet_name=params.sheet_name,
-                results_tab="Results",
-                rows=all_rows,
-            )
-        for st in statuses:
-            await upsert_status(
-                sheet_name=params.sheet_name,
-                dashboard_tab="Dashboard",
-                row=[
-                    t.target_id, t.name, st.platform, st.searched,
-                    st.accounts_returned, st.accounts_checked,
-                    st.accounts_relevant, round(st.cost_usd, 4), st.error,
-                    datetime.utcnow().isoformat(timespec="seconds") + "Z",
-                ],
-            )
         return {
             "target_id": t.target_id,
             "platforms": [s.model_dump() for s in statuses],
+            "result_rows": all_rows,
             "total_relevant": sum(s.accounts_relevant for s in statuses),
         }
 
@@ -381,7 +365,10 @@ class SocialProfileSearchWorkflow:
             batch_stats[platform] = stats
 
         # ------------------------------------------------------------------
-        # Plateformes: enfant par cible (lignes de lot transmises si dispo)
+        # Plateformes: enfant par cible (lignes de lot transmises si dispo).
+        # Les enfants n'écrivent PAS dans le Sheet: le parent écrit Results +
+        # Dashboard en groupé, par vague de 50 enfants (~3 requêtes par vague
+        # au lieu de ~20 par enfant, pour rester loin du quota Google Sheets).
         # ------------------------------------------------------------------
         child_items = [
             ProcessTargetParams(
@@ -396,27 +383,76 @@ class SocialProfileSearchWorkflow:
             )
             for t in targets
         ]
-        results = await workflows.execute_activities_in_parallel(
-            activity=run_target_child,
-            items=child_items,
-            max_concurrent_scheduled_tasks=max(1, params.max_concurrent_targets),
-        )
+        wave_size = 50
+        all_failures = 0
+        total_relevant = 0
+        results_rows_written = 0
+        status_rows_written = 0
+        for i in range(0, len(child_items), wave_size):
+            chunk = child_items[i:i + wave_size]
+            wave_results = await workflows.execute_activities_in_parallel(
+                activity=run_target_child,
+                items=chunk,
+                max_concurrent_scheduled_tasks=max(1, params.max_concurrent_targets),
+            )
+            csv_rows: list[list] = []
+            status_rows: list[list] = []
+            now = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+            for child, res in zip(chunk, wave_results):
+                if res is None:
+                    all_failures += 1
+                    continue
+                total_relevant += res.get("total_relevant", 0)
+                csv_rows.extend(res.get("result_rows", []))
+                for st in res.get("platforms", []):
+                    status_rows.append([
+                        child.target.target_id, child.target.name,
+                        st.get("platform", ""), st.get("searched", False),
+                        st.get("accounts_returned", 0),
+                        st.get("accounts_checked", 0),
+                        st.get("accounts_relevant", 0),
+                        round(st.get("cost_usd", 0.0) or 0.0, 4),
+                        st.get("error", ""), now,
+                    ])
+            if csv_rows or status_rows:
+                w = await write_wave(
+                    sheet_name=params.sheet_name,
+                    csv_rows=csv_rows,
+                    status_rows=status_rows,
+                )
+                results_rows_written += w.get("results_rows", 0)
+                status_rows_written += w.get("status_rows", 0)
 
         usage_end = await fetch_usage_usd()
-        total_relevant = sum(
-            (r or {}).get("total_relevant", 0) for r in results if r
-        )
-        failures = sum(1 for r in results if r is None)
+        processed = len(child_items) - all_failures
         return {
             "targets": len(targets),
-            "processed": len(results) - failures,
-            "failed": failures,
+            "processed": processed,
+            "failed": all_failures,
             "accounts_relevant_total": total_relevant,
+            "results_rows_written": results_rows_written,
+            "status_rows_written": status_rows_written,
             "apify_usage_usd": round(usage_end - usage_start, 4),
             "batch_stats": batch_stats,
             "cleanup": cleanup_summary,
             "skipped_existing": skipped_existing,
         }
+
+
+@workflows.activity(
+    start_to_close_timeout=timedelta(minutes=5),
+    retry_policy_max_attempts=4,
+)
+async def write_wave(sheet_name: str, csv_rows: list[list], status_rows: list[list]) -> dict:
+    """Écrit groupée d'une vague: append Results + upsert Dashboard en ~3 requêtes."""
+    import httpx
+    from .sheets import SheetsClient, find_spreadsheet_id
+
+    spreadsheet_id = await find_spreadsheet_id(sheet_name)
+    sheets = SheetsClient(spreadsheet_id)
+    async with httpx.AsyncClient(timeout=300) as client:
+        n_results, n_status = await sheets.bulk_write(client, csv_rows, status_rows)
+    return {"results_rows": n_results, "status_rows": n_status}
 
 
 @workflows.activity(

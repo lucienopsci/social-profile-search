@@ -264,6 +264,106 @@ class SheetsClient:
                 ids.append(tid)
         return ids
 
+    async def bulk_write(self, client: httpx.AsyncClient, csv_rows: list[list], status_rows: list[list]) -> tuple[int, int]:
+        """Écrit groupée: append Results (lots de 1000 lignes) + upsert Dashboard
+        (mise à jour en place via values:batchUpdate + append des nouvelles lignes).
+
+        ~3 requêtes pour un lot, contre ~20 par cible en écriture individuelle.
+        Retourne (lignes results écrites, lignes dashboard écrites).
+        """
+        n_results = 0
+        if csv_rows:
+            real_results = await self.ensure_tab(client, "Results", CSV_HEADERS)
+            for i in range(0, len(csv_rows), 1000):
+                chunk = csv_rows[i:i + 1000]
+                r = await self._req(
+                    client, "POST",
+                    f"{SHEETS_BASE}/{self.id}/values/{_range(real_results, 'A1')}:append",
+                    params={"valueInputOption": "USER_ENTERED", "insertDataOption": "INSERT_ROWS"},
+                    json={"values": chunk},
+                )
+                if r.status_code != 200:
+                    raise RuntimeError(
+                        f"Impossible d'écrire dans l'onglet '{real_results}' (HTTP {r.status_code}). "
+                        f"Réponse Google: {r.text[:300]}"
+                    )
+                n_results += len(chunk)
+
+        n_status = 0
+        if status_rows:
+            real_dash = await self.ensure_tab(client, "Dashboard", DASHBOARD_HEADERS)
+            r = await self._req(
+                client, "GET",
+                f"{SHEETS_BASE}/{self.id}/values/{_range(real_dash, 'A2:J')}",
+            )
+            if r.status_code != 200:
+                raise RuntimeError(
+                    f"Impossible de lire le dashboard '{real_dash}' (HTTP {r.status_code}). "
+                    f"Réponse Google: {r.text[:300]}"
+                )
+            existing = r.json().get("values", [])
+            index: dict[tuple[str, str], int] = {}
+            for i, erow in enumerate(existing):
+                a = str(erow[0]).strip() if len(erow) > 0 else ""
+                c = str(erow[2]).strip() if len(erow) > 2 else ""
+                if (a, c) not in index:
+                    index[(a, c)] = i + 2  # ligne réelle dans le sheet
+
+            width = len(DASHBOARD_HEADERS)
+
+            def pad(values: list) -> list:
+                values = [str(v) for v in values]
+                return (values + [""] * width)[:width]
+
+            updates: list[tuple[int, list]] = []
+            appends: list[list] = []
+            for row in status_rows:
+                key = (str(row[0]).strip(), str(row[2]).strip())
+                if key in index:
+                    updates.append((index[key], pad(row)))
+                else:
+                    appends.append(pad(row))
+
+            # mises à jour en place: values:batchUpdate (400 lignes par requête)
+            for i in range(0, len(updates), 400):
+                chunk = updates[i:i + 400]
+                r = await self._req(
+                    client, "POST",
+                    f"{SHEETS_BASE}/{self.id}/values:batchUpdate",
+                    json={
+                        "valueInputOption": "USER_ENTERED",
+                        "data": [
+                            {
+                                "range": _range(real_dash, f"A{rownum}:J{rownum}"),
+                                "values": [vals],
+                            }
+                            for rownum, vals in chunk
+                        ],
+                    },
+                )
+                if r.status_code != 200:
+                    raise RuntimeError(
+                        f"Impossible de mettre à jour le dashboard '{real_dash}' (HTTP {r.status_code}). "
+                        f"Réponse Google: {r.text[:300]}"
+                    )
+                n_status += len(chunk)
+
+            if appends:
+                r = await self._req(
+                    client, "POST",
+                    f"{SHEETS_BASE}/{self.id}/values/{_range(real_dash, 'A1')}:append",
+                    params={"valueInputOption": "USER_ENTERED", "insertDataOption": "INSERT_ROWS"},
+                    json={"values": appends},
+                )
+                if r.status_code != 200:
+                    raise RuntimeError(
+                        f"Impossible d'écrire dans le dashboard '{real_dash}' (HTTP {r.status_code}). "
+                        f"Réponse Google: {r.text[:300]}"
+                    )
+                n_status += len(appends)
+
+        return n_results, n_status
+
     async def append_results(self, client: httpx.AsyncClient, tab: str, rows: list[list]):
         """Ajoute les comptes trouvés (colonnes CSV_HEADERS + TRUE/FALSE) à l'onglet résultats."""
         real_tab = await self.ensure_tab(client, tab, CSV_HEADERS)
